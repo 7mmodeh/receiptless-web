@@ -1,346 +1,630 @@
 // app/r/[tokenId]/page.tsx
-export const dynamic = "force-dynamic";
+import React from "react";
 
-type PreviewItem = {
-  line_no: number;
-  sku: string | null;
-  name: string;
-  qty: number;
-  unit_price: number;
-  line_total: number;
-  vat_rate: number | null;
-  vat_amount: number | null;
+type ReceiptItem = {
+  name?: string | null;
+  sku?: string | null;
+  qty?: number | null;
+  unit_price?: number | null;
+  total?: number | null;
+  vat_rate?: number | null;
 };
 
 type TokenPreviewResponse = {
-  token: {
-    token_id: string;
-    status: "active" | "consumed";
-    consumed_at: string | null;
-  };
-  receipt: {
-    issued_at: string;
-    retailer_id: string;
-    store_id: string;
-    currency: string;
-    subtotal: number;
-    vat_total: number;
-    total: number;
-    items: PreviewItem[];
-  };
+  receipt?: {
+    issued_at?: string | null;
+    currency?: string | null; // e.g. "EUR"
+    subtotal?: number | null;
+    vat_total?: number | null;
+    total?: number | null;
+    items?: ReceiptItem[] | null;
+  } | null;
+
+  token?: {
+    status?: string | null; // e.g. "active" | "consumed" | "expired" | ...
+    consumed_at?: string | null;
+  } | null;
+
+  // Some implementations return these at top-level:
+  status?: string | null;
+  consumed_at?: string | null;
 };
 
-const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+type FetchError = {
+  message: string;
+  status?: number;
+};
 
-async function fetchPreview(tokenId: string): Promise<TokenPreviewResponse> {
-  const base = process.env.NEXT_PUBLIC_FUNCTIONS_BASE_URL;
-  if (!base) {
-    throw new Error(
-      "Missing NEXT_PUBLIC_FUNCTIONS_BASE_URL in Vercel env (Production)."
-    );
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
+export async function generateMetadata({
+  params,
+}: {
+  params: { tokenId: string };
+}) {
+  const tokenId = String(params?.tokenId || "").trim();
+
+  // Avoid leaking any internal errors into metadata
+  if (!isValidUuid(tokenId)) {
+    return {
+      title: "Receiptless | Invalid link",
+      description: "This receipt link is not valid.",
+      robots: { index: false, follow: false },
+    };
   }
 
-  const url = `${base}/token-preview?token_id=${encodeURIComponent(tokenId)}`;
+  return {
+    title: "Receiptless | Receipt",
+    description: "View your digital receipt securely.",
+    robots: { index: false, follow: false },
+  };
+}
+
+const UUID_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isValidUuid(value: string) {
+  return UUID_REGEX.test(value);
+}
+
+function formatDateTime(iso?: string | null) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return new Intl.DateTimeFormat("en-IE", {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(d);
+}
+
+function formatMoney(amount?: number | null, currency?: string | null) {
+  if (amount == null || Number.isNaN(amount)) return "—";
+  const cur = currency || "EUR";
+  try {
+    return new Intl.NumberFormat("en-IE", {
+      style: "currency",
+      currency: cur,
+      currencyDisplay: "symbol",
+      maximumFractionDigits: 2,
+    }).format(amount);
+  } catch {
+    // Fallback if currency is unexpected
+    return `${amount.toFixed(2)} ${cur}`;
+  }
+}
+
+function getFunctionsBaseUrl() {
+  const base = process.env.NEXT_PUBLIC_FUNCTIONS_BASE_URL;
+  return (base || "").replace(/\/+$/, "");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function getStringField(
+  obj: Record<string, unknown>,
+  key: string
+): string | null {
+  const v = obj[key];
+  return typeof v === "string" ? v : null;
+}
+
+function getNumberField(
+  obj: Record<string, unknown>,
+  key: string
+): number | null {
+  const v = obj[key];
+  return typeof v === "number" ? v : null;
+}
+
+function coerceFetchError(e: unknown, fallbackMessage: string): FetchError {
+  if (e instanceof Error) {
+    // If a status was attached as a non-standard field, ignore it here (we never attach it now).
+    return { message: e.message || fallbackMessage };
+  }
+
+  if (isRecord(e)) {
+    const msg = getStringField(e, "message");
+    const status = getNumberField(e, "status") ?? undefined;
+    if (msg) return { message: msg, status };
+  }
+
+  return { message: fallbackMessage };
+}
+
+async function tryFetchJson(url: string): Promise<TokenPreviewResponse> {
+  const controller = new AbortController();
+  const timeoutMs = 8000; // 8s is a good default for mobile networks
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   let res: Response;
   try {
-    res = await fetch(url, { cache: "no-store" });
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(`Network error calling token-preview: ${msg}`);
+    res = await fetch(url, {
+      method: "GET",
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    });
+  } catch (e) {
+    const err = coerceFetchError(e, "Request timed out or network error");
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
 
   const contentType = res.headers.get("content-type") || "";
-  const rawText = await res.text();
+  if (!contentType.toLowerCase().includes("application/json")) {
+    throw new Error(`Unexpected response content-type (${contentType})`);
+  }
 
-  let json: unknown = null;
-  if (contentType.includes("application/json")) {
+  const data = (await res.json()) as unknown;
+
+  if (!res.ok) {
+    let msg: string | null = null;
+    if (isRecord(data)) {
+      msg = getStringField(data, "error") ?? getStringField(data, "message");
+    }
+    const message = msg || `Request failed (${res.status})`;
+    const err: FetchError = { message, status: res.status };
+    throw err;
+  }
+
+  return data as TokenPreviewResponse;
+}
+
+/**
+ * Fetch token preview with a small set of URL patterns to avoid coupling
+ * to a single query-param name or route style.
+ */
+async function fetchTokenPreview(
+  tokenId: string
+): Promise<TokenPreviewResponse> {
+  const base = getFunctionsBaseUrl();
+  if (!base) throw new Error("Missing NEXT_PUBLIC_FUNCTIONS_BASE_URL");
+
+  const candidates = [
+    // Query param variations
+    `${base}/token-preview?tokenId=${encodeURIComponent(tokenId)}`,
+    `${base}/token-preview?token_id=${encodeURIComponent(tokenId)}`,
+    `${base}/token-preview?id=${encodeURIComponent(tokenId)}`,
+    // Path param style
+    `${base}/token-preview/${encodeURIComponent(tokenId)}`,
+  ];
+
+  let lastError: FetchError | null = null;
+
+  for (const url of candidates) {
     try {
-      json = JSON.parse(rawText);
-    } catch {
-      json = null;
+      return await tryFetchJson(url);
+    } catch (e) {
+      lastError = coerceFetchError(e, "Failed to load token preview");
+
+      // If it is clearly "not found", keep trying other patterns.
+      if (lastError.status && lastError.status !== 404) break;
     }
   }
 
-  if (!res.ok) {
-    const j = json as { error?: string; details?: string } | null;
-    const details = j?.details || j?.error || rawText || `HTTP ${res.status}`;
-    throw new Error(`token-preview failed: ${details}`);
+  if (lastError) {
+    // Throw as Error to preserve typical try/catch behavior up the stack
+    const err = new Error(lastError.message);
+    throw err;
   }
 
-  if (!json) {
-    throw new Error(
-      `token-preview returned non-JSON response: ${rawText.slice(0, 200)}`
-    );
-  }
-
-  return json as TokenPreviewResponse;
+  throw new Error("Failed to load token preview");
 }
 
-export default async function ReceiptPage({
+function normalizeTokenStatus(data: TokenPreviewResponse) {
+  const status = data?.token?.status ?? data?.status ?? null;
+  const consumedAt = data?.token?.consumed_at ?? data?.consumed_at ?? null;
+  return { status, consumedAt };
+}
+
+export default async function ReceiptTokenPage({
   params,
 }: {
-  // Next.js 16+ may pass params as a Promise in server components
-  params: Promise<{ tokenId?: string }> | { tokenId?: string };
+  params: { tokenId: string };
 }) {
-  type ParamsType = { tokenId?: string };
+  const tokenId = String(params?.tokenId || "").trim();
 
-  function isPromise<T>(v: unknown): v is Promise<T> {
-    return typeof v === "object" && v !== null && "then" in v;
-  }
-
-  const resolvedParams: ParamsType = isPromise<ParamsType>(params)
-    ? await params
-    : params;
-
-  const tokenIdRaw = String(resolvedParams?.tokenId ?? "").trim();
-
-  const debugPanel = (
-    <div
-      style={{
-        marginTop: 14,
-        padding: 12,
-        borderRadius: 12,
-        border: "1px solid #eee",
-        background: "#fafafa",
-        fontSize: 12,
-        color: "#333",
-      }}
-    >
-      <div style={{ fontWeight: 900 }}>Debug</div>
-      <div style={{ marginTop: 6 }}>
-        tokenIdRaw: <code>{tokenIdRaw || "(empty)"}</code>
-      </div>
-      <div style={{ marginTop: 6 }}>
-        isUUID: <code>{UUID_RE.test(tokenIdRaw) ? "true" : "false"}</code>
-      </div>
-      <div style={{ marginTop: 6 }}>
-        functions base:{" "}
-        <code>{process.env.NEXT_PUBLIC_FUNCTIONS_BASE_URL || "(missing)"}</code>
-      </div>
-    </div>
-  );
-
-  if (!tokenIdRaw) {
+  // UUID validation
+  if (!isValidUuid(tokenId)) {
     return (
-      <main
-        style={{
-          padding: 24,
-          fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
-        }}
-      >
-        <h1 style={{ fontSize: 22, fontWeight: 900, margin: 0 }}>
-          Receiptless
-        </h1>
-        <p style={{ marginTop: 12, fontWeight: 700 }}>Missing token in URL.</p>
-        <p style={{ marginTop: 6, color: "#555" }}>
-          Use: <code>/r/&lt;token_uuid&gt;</code>
-        </p>
-        {debugPanel}
+      <main style={styles.page}>
+        <div style={styles.card}>
+          <h1 style={styles.h1}>Invalid link</h1>
+          <p style={styles.p}>
+            This receipt link is not valid. Please check the URL and try again.
+          </p>
+        </div>
       </main>
     );
   }
 
-  if (!UUID_RE.test(tokenIdRaw)) {
-    return (
-      <main
-        style={{
-          padding: 24,
-          fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
-        }}
-      >
-        <h1 style={{ fontSize: 22, fontWeight: 900, margin: 0 }}>
-          Receiptless
-        </h1>
-        <p style={{ marginTop: 12, fontWeight: 700 }}>Invalid token format.</p>
-        <p style={{ marginTop: 6, color: "#555" }}>
-          Token must be a UUID. Received: <code>{tokenIdRaw}</code>
-        </p>
-        {debugPanel}
-      </main>
-    );
-  }
+  // Fetch data
+  let data: TokenPreviewResponse | null = null;
+  let errorMessage: string | null = null;
 
-  let data: TokenPreviewResponse;
   try {
-    data = await fetchPreview(tokenIdRaw);
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Unknown error";
+    data = await fetchTokenPreview(tokenId);
+  } catch (e) {
+    const err = coerceFetchError(
+      e,
+      "We couldn't load this receipt right now. Please try again."
+    );
+    errorMessage = err.message;
+  }
 
+  if (errorMessage || !data) {
     return (
-      <main
-        style={{
-          padding: 24,
-          fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
-        }}
-      >
-        <h1 style={{ fontSize: 22, fontWeight: 900, margin: 0 }}>
-          Receiptless
-        </h1>
-        <p style={{ marginTop: 12, fontWeight: 700 }}>
-          Could not load receipt.
-        </p>
-        <p style={{ marginTop: 6, color: "#555" }}>{message}</p>
-        {debugPanel}
+      <main style={styles.page}>
+        <div style={styles.card}>
+          <div style={styles.headerRow}>
+            <h1 style={styles.h1}>Receipt</h1>
+            <a href={`receiptless://r/${tokenId}`} style={styles.primaryBtn}>
+              Open in app
+            </a>
+          </div>
+
+          <div style={styles.divider} />
+
+          <div style={styles.bannerError}>
+            <strong>Unable to load receipt</strong>
+            <div style={{ marginTop: 6, opacity: 0.9 }}>{errorMessage}</div>
+          </div>
+
+          <p style={{ ...styles.p, marginTop: 14, color: "rgba(0,0,0,0.65)" }}>
+            If the problem persists, request a fresh link from the merchant.
+          </p>
+        </div>
       </main>
     );
   }
 
-  const { token, receipt } = data;
-  const deepLink = `receiptless://r/${tokenIdRaw}`;
+  const receipt = data.receipt ?? null;
+  const items = (receipt?.items ?? []) as ReceiptItem[];
+
+  const { status, consumedAt } = normalizeTokenStatus(data);
+  const normalizedStatus = (status || "").toLowerCase();
+  const isConsumed =
+    normalizedStatus === "consumed" ||
+    normalizedStatus === "used" ||
+    normalizedStatus === "already_used";
+
+  const isInactive =
+    isConsumed ||
+    (normalizedStatus &&
+      normalizedStatus !== "active" &&
+      normalizedStatus !== "valid");
+
+  const currency = receipt?.currency ?? "EUR";
 
   return (
-    <main
-      style={{
-        padding: 24,
-        maxWidth: 720,
-        margin: "0 auto",
-        fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
-      }}
-    >
-      <header
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          gap: 12,
-          alignItems: "center",
-        }}
-      >
-        <h1 style={{ fontSize: 22, fontWeight: 900, margin: 0 }}>
-          Receiptless
-        </h1>
-        <a
-          href={deepLink}
-          style={{
-            display: "inline-block",
-            padding: "10px 14px",
-            borderRadius: 12,
-            background: "#111",
-            color: "white",
-            textDecoration: "none",
-            fontWeight: 800,
-          }}
-        >
-          Open in app
-        </a>
-      </header>
+    <main style={styles.page}>
+      <div style={styles.card}>
+        <div style={styles.headerRow}>
+          <div>
+            <h1 style={styles.h1}>Receipt</h1>
+            <div style={styles.subtle}>Token: {tokenId}</div>
+          </div>
 
-      <section
-        style={{
-          marginTop: 16,
-          border: "1px solid #ddd",
-          borderRadius: 14,
-          padding: 14,
-        }}
-      >
-        <div style={{ fontSize: 12, color: "#666", fontWeight: 700 }}>
-          Token Status
-        </div>
-        <div style={{ fontSize: 16, fontWeight: 800 }}>{token.status}</div>
-
-        <div
-          style={{
-            marginTop: 10,
-            fontSize: 12,
-            color: "#666",
-            fontWeight: 700,
-          }}
-        >
-          Issued At
-        </div>
-        <div style={{ fontSize: 16, fontWeight: 700 }}>
-          {new Date(receipt.issued_at).toLocaleString()}
+          <a href={`receiptless://r/${tokenId}`} style={styles.primaryBtn}>
+            Open in app
+          </a>
         </div>
 
-        <div
-          style={{
-            marginTop: 10,
-            fontSize: 12,
-            color: "#666",
-            fontWeight: 700,
-          }}
-        >
-          Total
-        </div>
-        <div style={{ fontSize: 28, fontWeight: 900 }}>
-          {receipt.currency} {Number(receipt.total).toFixed(2)}
-        </div>
-
-        <div style={{ display: "flex", gap: 12, marginTop: 10 }}>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 12, color: "#666", fontWeight: 700 }}>
-              Subtotal
+        {isInactive ? (
+          <div style={isConsumed ? styles.bannerConsumed : styles.bannerWarn}>
+            <div style={{ fontWeight: 700 }}>
+              {isConsumed
+                ? "Consumed / Already used"
+                : "This token is not active"}
             </div>
-            <div style={{ fontSize: 16, fontWeight: 800 }}>
-              {receipt.currency} {Number(receipt.subtotal).toFixed(2)}
+            <div style={{ marginTop: 6, opacity: 0.95 }}>
+              {isConsumed ? (
+                <>
+                  Consumed at: <strong>{formatDateTime(consumedAt)}</strong>
+                </>
+              ) : (
+                <>
+                  Status: <strong>{status || "unknown"}</strong>
+                  {consumedAt ? (
+                    <>
+                      {" "}
+                      • Consumed at:{" "}
+                      <strong>{formatDateTime(consumedAt)}</strong>
+                    </>
+                  ) : null}
+                </>
+              )}
             </div>
           </div>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 12, color: "#666", fontWeight: 700 }}>
-              VAT
-            </div>
-            <div style={{ fontSize: 16, fontWeight: 800 }}>
-              {receipt.currency} {Number(receipt.vat_total).toFixed(2)}
-            </div>
-          </div>
-        </div>
-
-        {token.consumed_at ? (
-          <>
-            <div
-              style={{
-                marginTop: 10,
-                fontSize: 12,
-                color: "#666",
-                fontWeight: 700,
-              }}
-            >
-              Consumed At
-            </div>
-            <div style={{ fontSize: 16, fontWeight: 800 }}>
-              {new Date(token.consumed_at).toLocaleString()}
-            </div>
-          </>
         ) : null}
-      </section>
 
-      <h2 style={{ marginTop: 18, fontSize: 16, fontWeight: 900 }}>Items</h2>
-      <section
-        style={{
-          border: "1px solid #ddd",
-          borderRadius: 14,
-          padding: 12,
-        }}
-      >
-        {receipt.items.map((it, idx) => (
-          <div
-            key={`${it.line_no}-${it.sku ?? "na"}-${idx}`}
-            style={{
-              display: "flex",
-              gap: 12,
-              padding: "10px 0",
-              borderBottom: "1px solid #eee",
-            }}
-          >
-            <div style={{ flex: 1 }}>
-              <div style={{ fontWeight: 900 }}>{it.name}</div>
-              <div style={{ color: "#666", fontSize: 12, marginTop: 4 }}>
-                Qty {Number(it.qty)} · {receipt.currency}{" "}
-                {Number(it.unit_price).toFixed(2)}
-                {it.sku ? ` · ${it.sku}` : ""}
+        <div style={styles.divider} />
+
+        <section style={styles.section}>
+          <div style={styles.kvGrid}>
+            <div style={styles.kv}>
+              <div style={styles.k}>Issued</div>
+              <div style={styles.v}>{formatDateTime(receipt?.issued_at)}</div>
+            </div>
+            <div style={styles.kv}>
+              <div style={styles.k}>Currency</div>
+              <div style={styles.v}>{currency}</div>
+            </div>
+            <div style={styles.kv}>
+              <div style={styles.k}>Subtotal</div>
+              <div style={styles.v}>
+                {formatMoney(receipt?.subtotal, currency)}
               </div>
             </div>
-            <div style={{ fontWeight: 900 }}>
-              {receipt.currency} {Number(it.line_total).toFixed(2)}
+            <div style={styles.kv}>
+              <div style={styles.k}>VAT</div>
+              <div style={styles.v}>
+                {formatMoney(receipt?.vat_total, currency)}
+              </div>
+            </div>
+            <div style={styles.kv}>
+              <div style={styles.k}>Total</div>
+              <div style={{ ...styles.v, fontWeight: 800 }}>
+                {formatMoney(receipt?.total, currency)}
+              </div>
             </div>
           </div>
-        ))}
-      </section>
+        </section>
 
-      <p style={{ marginTop: 16, fontSize: 12, color: "#666" }}>
-        Token ID: {token.token_id}
-      </p>
+        <div style={styles.divider} />
+
+        <section style={styles.section}>
+          <h2 style={styles.h2}>Items</h2>
+
+          {items.length === 0 ? (
+            <p style={styles.p}>No items found on this receipt.</p>
+          ) : (
+            <div
+              style={styles.tableWrap}
+              role="table"
+              aria-label="Receipt items"
+            >
+              <div style={styles.tableHeader} role="row">
+                <div style={{ ...styles.th, flex: 2 }} role="columnheader">
+                  Item
+                </div>
+                <div
+                  style={{ ...styles.th, flex: 0.6, textAlign: "right" }}
+                  role="columnheader"
+                >
+                  Qty
+                </div>
+                <div
+                  style={{ ...styles.th, flex: 1, textAlign: "right" }}
+                  role="columnheader"
+                >
+                  Unit
+                </div>
+                <div
+                  style={{ ...styles.th, flex: 1, textAlign: "right" }}
+                  role="columnheader"
+                >
+                  Line total
+                </div>
+              </div>
+
+              {items.map((it, idx) => {
+                const name = it?.name ?? it?.sku ?? `Item ${idx + 1}`;
+                const qty = it?.qty ?? 1;
+                const unitPrice = it?.unit_price ?? null;
+                const lineTotal =
+                  it?.total ??
+                  (unitPrice != null ? unitPrice * (qty || 1) : null);
+
+                return (
+                  <div key={idx} style={styles.tr} role="row">
+                    <div style={{ ...styles.td, flex: 2 }} role="cell">
+                      <div style={{ fontWeight: 650 }}>{name}</div>
+                      {it?.sku ? (
+                        <div style={styles.subtleSmall}>SKU: {it.sku}</div>
+                      ) : null}
+                      {it?.vat_rate != null ? (
+                        <div style={styles.subtleSmall}>
+                          VAT rate: {it.vat_rate}%
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div
+                      style={{ ...styles.td, flex: 0.6, textAlign: "right" }}
+                      role="cell"
+                    >
+                      {qty ?? "—"}
+                    </div>
+
+                    <div
+                      style={{ ...styles.td, flex: 1, textAlign: "right" }}
+                      role="cell"
+                    >
+                      {formatMoney(unitPrice, currency)}
+                    </div>
+
+                    <div
+                      style={{
+                        ...styles.td,
+                        flex: 1,
+                        textAlign: "right",
+                        fontWeight: 700,
+                      }}
+                      role="cell"
+                    >
+                      {formatMoney(lineTotal, currency)}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        <div style={styles.footerNote}>
+          If the deep link does not open, ensure the Receiptless app is
+          installed and try again.
+        </div>
+      </div>
     </main>
   );
 }
+
+const styles: Record<string, React.CSSProperties> = {
+  page: {
+    minHeight: "100vh",
+    padding: "24px 16px",
+    background: "#f6f7f9",
+    display: "flex",
+    justifyContent: "center",
+  },
+  card: {
+    width: "100%",
+    maxWidth: 880,
+    background: "#ffffff",
+    border: "1px solid rgba(0,0,0,0.08)",
+    borderRadius: 14,
+    padding: 18,
+    boxShadow: "0 8px 24px rgba(0,0,0,0.06)",
+  },
+  headerRow: {
+    display: "flex",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  h1: {
+    margin: 0,
+    fontSize: 22,
+    lineHeight: 1.2,
+    letterSpacing: -0.2,
+  },
+  h2: {
+    margin: "0 0 12px 0",
+    fontSize: 16,
+    letterSpacing: -0.1,
+  },
+  p: {
+    margin: 0,
+    fontSize: 14,
+    lineHeight: 1.55,
+    color: "rgba(0,0,0,0.82)",
+  },
+  subtle: {
+    marginTop: 6,
+    fontSize: 12.5,
+    color: "rgba(0,0,0,0.55)",
+    wordBreak: "break-all",
+  },
+  subtleSmall: {
+    marginTop: 4,
+    fontSize: 12,
+    color: "rgba(0,0,0,0.55)",
+  },
+  divider: {
+    height: 1,
+    background: "rgba(0,0,0,0.08)",
+    margin: "16px 0",
+  },
+  section: {
+    display: "block",
+  },
+  kvGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+    gap: 12,
+  },
+  kv: {
+    background: "rgba(0,0,0,0.02)",
+    border: "1px solid rgba(0,0,0,0.06)",
+    borderRadius: 12,
+    padding: 12,
+  },
+  k: {
+    fontSize: 12,
+    color: "rgba(0,0,0,0.55)",
+    marginBottom: 6,
+  },
+  v: {
+    fontSize: 14,
+    color: "rgba(0,0,0,0.88)",
+  },
+  primaryBtn: {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    height: 36,
+    padding: "0 14px",
+    borderRadius: 10,
+    textDecoration: "none",
+    fontSize: 13.5,
+    fontWeight: 700,
+    color: "#ffffff",
+    background: "#111827",
+    border: "1px solid rgba(0,0,0,0.08)",
+    whiteSpace: "nowrap",
+  },
+  bannerConsumed: {
+    marginTop: 14,
+    padding: 12,
+    borderRadius: 12,
+    background: "rgba(239, 68, 68, 0.10)",
+    border: "1px solid rgba(239, 68, 68, 0.25)",
+    color: "rgba(0,0,0,0.86)",
+  },
+  bannerWarn: {
+    marginTop: 14,
+    padding: 12,
+    borderRadius: 12,
+    background: "rgba(245, 158, 11, 0.12)",
+    border: "1px solid rgba(245, 158, 11, 0.25)",
+    color: "rgba(0,0,0,0.86)",
+  },
+  bannerError: {
+    padding: 12,
+    borderRadius: 12,
+    background: "rgba(239, 68, 68, 0.10)",
+    border: "1px solid rgba(239, 68, 68, 0.25)",
+    color: "rgba(0,0,0,0.86)",
+  },
+  tableWrap: {
+    border: "1px solid rgba(0,0,0,0.08)",
+    borderRadius: 12,
+    overflow: "hidden",
+  },
+  tableHeader: {
+    display: "flex",
+    gap: 10,
+    padding: "10px 12px",
+    background: "rgba(0,0,0,0.03)",
+    borderBottom: "1px solid rgba(0,0,0,0.08)",
+  },
+  th: {
+    fontSize: 12,
+    fontWeight: 800,
+    color: "rgba(0,0,0,0.70)",
+  },
+  tr: {
+    display: "flex",
+    gap: 10,
+    padding: "12px",
+    borderBottom: "1px solid rgba(0,0,0,0.06)",
+  },
+  td: {
+    fontSize: 13.5,
+    color: "rgba(0,0,0,0.86)",
+  },
+  footerNote: {
+    marginTop: 14,
+    fontSize: 12.5,
+    color: "rgba(0,0,0,0.55)",
+  },
+};
