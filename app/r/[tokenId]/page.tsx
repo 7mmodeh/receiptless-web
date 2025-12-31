@@ -82,6 +82,43 @@ export default async function ReceiptPage({
 }) {
   const tokenId = String(params.tokenId || "").trim();
 
+  const UUID_RE =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+  if (!tokenId) {
+    return (
+      <main
+        style={{
+          padding: 24,
+          fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
+        }}
+      >
+        <h1 style={{ fontSize: 22, fontWeight: 900 }}>Receiptless</h1>
+        <p style={{ marginTop: 12, fontWeight: 700 }}>Missing token in URL.</p>
+        <p style={{ marginTop: 6, color: "#555" }}>
+          Use: <code>/r/&lt;token_uuid&gt;</code>
+        </p>
+      </main>
+    );
+  }
+
+  if (!UUID_RE.test(tokenId)) {
+    return (
+      <main
+        style={{
+          padding: 24,
+          fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
+        }}
+      >
+        <h1 style={{ fontSize: 22, fontWeight: 900 }}>Receiptless</h1>
+        <p style={{ marginTop: 12, fontWeight: 700 }}>Invalid token format.</p>
+        <p style={{ marginTop: 6, color: "#555" }}>
+          Token must be a UUID. Received: <code>{tokenId}</code>
+        </p>
+      </main>
+    );
+  }
+
   let data: TokenPreviewResponse;
   try {
     data = await fetchPreview(tokenId);
