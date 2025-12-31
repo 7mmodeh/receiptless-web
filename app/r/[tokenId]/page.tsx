@@ -81,12 +81,21 @@ async function fetchPreview(tokenId: string): Promise<TokenPreviewResponse> {
 export default async function ReceiptPage({
   params,
 }: {
-  params: { tokenId?: string };
+  // Next.js 16+ may pass params as a Promise in server components
+  params: Promise<{ tokenId?: string }> | { tokenId?: string };
 }) {
-  // IMPORTANT: read params inside the function (this is where it exists)
-  const tokenIdRaw = String(params?.tokenId ?? "").trim();
+  type ParamsType = { tokenId?: string };
 
-  // Debug panel that shows what Next.js thinks the tokenId is
+  function isPromise<T>(v: unknown): v is Promise<T> {
+    return typeof v === "object" && v !== null && "then" in v;
+  }
+
+  const resolvedParams: ParamsType = isPromise<ParamsType>(params)
+    ? await params
+    : params;
+
+  const tokenIdRaw = String(resolvedParams?.tokenId ?? "").trim();
+
   const debugPanel = (
     <div
       style={{
