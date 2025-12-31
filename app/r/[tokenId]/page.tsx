@@ -212,37 +212,44 @@ function getQueryToken(
 function normalizeIncomingToken(rawValue: string): string {
   let s = rawValue.trim();
 
-  // Decode defensively
   try {
     s = decodeURIComponent(s);
   } catch {
     // ignore
   }
 
-  // Replace common Unicode hyphens/dashes with ASCII hyphen
   s = s.replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-");
-
-  // Strip zero-width characters (copy/paste artifacts)
   s = s.replace(/[\u200B\u200C\u200D\u2060\uFEFF]/g, "");
 
-  // Extract UUID substring
   const m = s.match(UUID_EXTRACT_RE);
   return (m?.[0] ?? "").trim();
 }
 
+type SearchParams = Record<string, string | string[] | undefined>;
+
+type PageProps = {
+  params: { tokenId?: string } | Promise<{ tokenId?: string }>;
+  searchParams?: SearchParams | Promise<SearchParams>;
+};
+
 export default async function ReceiptTokenPage({
   params,
   searchParams,
-}: {
-  params: { tokenId?: string };
-  searchParams?: Record<string, string | string[] | undefined>;
-}) {
+}: PageProps) {
+  // Next.js in some setups can pass params/searchParams as Promises. Resolve defensively.
+  const resolvedParams = await Promise.resolve(params);
+  const resolvedSearchParams = searchParams
+    ? await Promise.resolve(searchParams)
+    : undefined;
+
   // Primary: /r/<tokenId>
-  const tokenId = normalizeIncomingToken(String(params?.tokenId ?? ""));
+  const tokenId = normalizeIncomingToken(String(resolvedParams?.tokenId ?? ""));
 
   // Fallback: /r?tokenId=<uuid> -> redirect to canonical /r/<uuid>
   if (!tokenId) {
-    const q = normalizeIncomingToken(String(getQueryToken(searchParams) ?? ""));
+    const q = normalizeIncomingToken(
+      String(getQueryToken(resolvedSearchParams) ?? "")
+    );
     if (q && isValidUuid(q)) {
       redirect(`/r/${q}`);
     }
@@ -252,8 +259,9 @@ export default async function ReceiptTokenPage({
     return (
       <main style={styles.page}>
         <div style={styles.card}>
-          <h1 style={styles.h1}>INVALID-LINK-MARKER__A9F2__DO-NOT-REMOVE</h1>
-          <p style={styles.p}>
+          <h1 style={styles.h1}>Invalid link</h1>
+          <p style={styles.p}>INVALID-LINK-MARKER__A9F2__DO-NOT-REMOVE</p>
+          <p style={{ ...styles.p, marginTop: 10 }}>
             This receipt link is not valid. Please check the URL and try again.
           </p>
         </div>
