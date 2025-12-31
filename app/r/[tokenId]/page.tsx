@@ -208,11 +208,18 @@ export default async function ReceiptTokenPage({
   searchParams?: Record<string, string | string[] | undefined>;
 }) {
   // Primary: /r/<tokenId>
-  const rawToken = String(params?.tokenId || "").trim();
+  const raw = String(params?.tokenId || "").trim();
 
-  // If the token is wrapped (e.g. "receiptless://r/<uuid>"), extract the UUID substring.
-  const extracted = rawToken.match(UUID_REGEX)?.[0] ?? "";
-  const tokenId = extracted.trim();
+  // Decode defensively (won't throw if already decoded)
+  let decoded = raw;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    // ignore
+  }
+
+  // Extract the UUID substring (works even if token is wrapped or has extra chars)
+  const tokenId = decoded.match(UUID_REGEX)?.[0] ?? "";
 
   // Fallback: /r?tokenId=<uuid> (redirect to canonical /r/<uuid>)
   if (!tokenId) {
@@ -235,6 +242,8 @@ export default async function ReceiptTokenPage({
       </main>
     );
   }
+
+  console.log("receiptless token params", { raw, decoded, tokenId });
 
   // Fetch data
   let data: TokenPreviewResponse | null = null;
