@@ -32,15 +32,44 @@ type TokenPreviewResponse = {
 
 async function fetchPreview(tokenId: string): Promise<TokenPreviewResponse> {
   const base = process.env.NEXT_PUBLIC_FUNCTIONS_BASE_URL;
-  if (!base) throw new Error("Missing NEXT_PUBLIC_FUNCTIONS_BASE_URL");
+  if (!base) {
+    throw new Error(
+      "Missing NEXT_PUBLIC_FUNCTIONS_BASE_URL in Vercel env (Production)."
+    );
+  }
 
   const url = `${base}/token-preview?token_id=${encodeURIComponent(tokenId)}`;
-  const res = await fetch(url, { cache: "no-store" });
-  const json = await res.json();
+
+  let res: Response;
+  try {
+    res = await fetch(url, { cache: "no-store" });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`Network error calling token-preview: ${msg}`);
+  }
+
+  const contentType = res.headers.get("content-type") || "";
+  const rawText = await res.text(); // read once
+
+  let json: unknown = null;
+  if (contentType.includes("application/json")) {
+    try {
+      json = JSON.parse(rawText);
+    } catch {
+      // keep json as null
+    }
+  }
 
   if (!res.ok) {
-    const msg = json?.error || `Preview failed (${res.status})`;
-    throw new Error(msg);
+    const j = json as { error?: string; details?: string } | null;
+    const details = j?.details || j?.error || rawText || `HTTP ${res.status}`;
+    throw new Error(`token-preview failed: ${details}`);
+  }
+
+  if (!json) {
+    throw new Error(
+      `token-preview returned non-JSON response: ${rawText.slice(0, 200)}`
+    );
   }
 
   return json as TokenPreviewResponse;
@@ -71,6 +100,15 @@ export default async function ReceiptPage({
           Could not load receipt.
         </p>
         <p style={{ marginTop: 6, color: "#555" }}>{message}</p>
+
+        <div style={{ marginTop: 14, fontSize: 12, color: "#666" }}>
+          Debug info:
+          <div>tokenId: {tokenId || "(empty)"}</div>
+          <div>
+            functions base:{" "}
+            {process.env.NEXT_PUBLIC_FUNCTIONS_BASE_URL || "(missing)"}
+          </div>
+        </div>
       </main>
     );
   }
@@ -195,7 +233,11 @@ export default async function ReceiptPage({
 
       <h2 style={{ marginTop: 18, fontSize: 16, fontWeight: 900 }}>Items</h2>
       <section
-        style={{ border: "1px solid #ddd", borderRadius: 14, padding: 12 }}
+        style={{
+          border: "1px solid #ddd",
+          borderRadius: 14,
+          padding: 12,
+        }}
       >
         {receipt.items.map((it) => (
           <div
