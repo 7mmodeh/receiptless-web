@@ -208,7 +208,11 @@ export default async function ReceiptTokenPage({
   searchParams?: Record<string, string | string[] | undefined>;
 }) {
   // Primary: /r/<tokenId>
-  const tokenId = String(params?.tokenId || "").trim();
+  const rawToken = String(params?.tokenId || "").trim();
+
+  // If the token is wrapped (e.g. "receiptless://r/<uuid>"), extract the UUID substring.
+  const extracted = rawToken.match(UUID_REGEX)?.[0] ?? "";
+  const tokenId = extracted.trim();
 
   // Fallback: /r?tokenId=<uuid> (redirect to canonical /r/<uuid>)
   if (!tokenId) {
