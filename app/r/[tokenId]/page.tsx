@@ -220,7 +220,6 @@ function normalizeIncomingToken(rawValue: string): string {
   }
 
   // Replace common Unicode hyphens/dashes with ASCII hyphen
-  // (These can appear when copying from some apps/notes)
   s = s.replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-");
 
   // Strip zero-width characters (copy/paste artifacts)
