@@ -29,7 +29,6 @@ type TokenPreviewResponse = {
     consumed_at?: string | null;
   } | null;
 
-  // Some implementations return these at top-level:
   status?: string | null;
   consumed_at?: string | null;
 };
@@ -39,11 +38,10 @@ type FetchError = {
   status?: number;
 };
 
-// IMPORTANT: do NOT use /g here (global regex makes .test() stateful).
+// IMPORTANT: no /g flag here (global regex makes .test() stateful).
 const UUID_VALIDATE_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-// Extractor can be the same pattern without anchors.
 const UUID_EXTRACT_RE =
   /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i;
 
@@ -204,19 +202,32 @@ function getQueryToken(
   return pick("tokenId") ?? pick("token_id") ?? pick("id");
 }
 
+/**
+ * Normalizes any incoming token string:
+ * - decodeURIComponent safely
+ * - replace Unicode hyphens with ASCII '-'
+ * - strip zero-width/invisible characters
+ * - extract UUID substring
+ */
 function normalizeIncomingToken(rawValue: string): string {
-  const raw = rawValue.trim();
+  let s = rawValue.trim();
 
   // Decode defensively
-  let decoded = raw;
   try {
-    decoded = decodeURIComponent(raw);
+    s = decodeURIComponent(s);
   } catch {
     // ignore
   }
 
-  // Extract UUID substring if wrapped
-  const m = decoded.match(UUID_EXTRACT_RE);
+  // Replace common Unicode hyphens/dashes with ASCII hyphen
+  // (These can appear when copying from some apps/notes)
+  s = s.replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-");
+
+  // Strip zero-width characters (copy/paste artifacts)
+  s = s.replace(/[\u200B\u200C\u200D\u2060\uFEFF]/g, "");
+
+  // Extract UUID substring
+  const m = s.match(UUID_EXTRACT_RE);
   return (m?.[0] ?? "").trim();
 }
 
@@ -228,8 +239,7 @@ export default async function ReceiptTokenPage({
   searchParams?: Record<string, string | string[] | undefined>;
 }) {
   // Primary: /r/<tokenId>
-  const tokenIdFromPath = normalizeIncomingToken(String(params?.tokenId ?? ""));
-  const tokenId = tokenIdFromPath;
+  const tokenId = normalizeIncomingToken(String(params?.tokenId ?? ""));
 
   // Fallback: /r?tokenId=<uuid> -> redirect to canonical /r/<uuid>
   if (!tokenId) {
@@ -252,7 +262,6 @@ export default async function ReceiptTokenPage({
     );
   }
 
-  // Fetch data
   let data: TokenPreviewResponse | null = null;
   let errorMessage: string | null = null;
 
