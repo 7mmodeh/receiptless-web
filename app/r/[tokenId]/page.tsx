@@ -1,5 +1,9 @@
 // app/r/[tokenId]/page.tsx
 import React from "react";
+import { redirect } from "next/navigation";
+
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
 type ReceiptItem = {
   name?: string | null;
@@ -35,32 +39,6 @@ type FetchError = {
   status?: number;
 };
 
-export const dynamic = "force-dynamic";
-export const revalidate = 0;
-
-export async function generateMetadata({
-  params,
-}: {
-  params: { tokenId: string };
-}) {
-  const tokenId = String(params?.tokenId || "").trim();
-
-  // Avoid leaking any internal errors into metadata
-  if (!isValidUuid(tokenId)) {
-    return {
-      title: "Receiptless | Invalid link",
-      description: "This receipt link is not valid.",
-      robots: { index: false, follow: false },
-    };
-  }
-
-  return {
-    title: "Receiptless | Receipt",
-    description: "View your digital receipt securely.",
-    robots: { index: false, follow: false },
-  };
-}
-
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -92,7 +70,6 @@ function formatMoney(amount?: number | null, currency?: string | null) {
       maximumFractionDigits: 2,
     }).format(amount);
   } catch {
-    // Fallback if currency is unexpected
     return `${amount.toFixed(2)} ${cur}`;
   }
 }
@@ -123,10 +100,7 @@ function getNumberField(
 }
 
 function coerceFetchError(e: unknown, fallbackMessage: string): FetchError {
-  if (e instanceof Error) {
-    // If a status was attached as a non-standard field, ignore it here (we never attach it now).
-    return { message: e.message || fallbackMessage };
-  }
+  if (e instanceof Error) return { message: e.message || fallbackMessage };
 
   if (isRecord(e)) {
     const msg = getStringField(e, "message");
@@ -138,8 +112,9 @@ function coerceFetchError(e: unknown, fallbackMessage: string): FetchError {
 }
 
 async function tryFetchJson(url: string): Promise<TokenPreviewResponse> {
+  // Add timeout so SSR never hangs
   const controller = new AbortController();
-  const timeoutMs = 8000; // 8s is a good default for mobile networks
+  const timeoutMs = 8000;
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   let res: Response;
@@ -151,8 +126,8 @@ async function tryFetchJson(url: string): Promise<TokenPreviewResponse> {
       signal: controller.signal,
     });
   } catch (e) {
-    const err = coerceFetchError(e, "Request timed out or network error");
-    throw err;
+    clearTimeout(timer);
+    throw coerceFetchError(e, "Request timed out or network error");
   } finally {
     clearTimeout(timer);
   }
@@ -177,10 +152,6 @@ async function tryFetchJson(url: string): Promise<TokenPreviewResponse> {
   return data as TokenPreviewResponse;
 }
 
-/**
- * Fetch token preview with a small set of URL patterns to avoid coupling
- * to a single query-param name or route style.
- */
 async function fetchTokenPreview(
   tokenId: string
 ): Promise<TokenPreviewResponse> {
@@ -188,11 +159,9 @@ async function fetchTokenPreview(
   if (!base) throw new Error("Missing NEXT_PUBLIC_FUNCTIONS_BASE_URL");
 
   const candidates = [
-    // Query param variations
     `${base}/token-preview?tokenId=${encodeURIComponent(tokenId)}`,
     `${base}/token-preview?token_id=${encodeURIComponent(tokenId)}`,
     `${base}/token-preview?id=${encodeURIComponent(tokenId)}`,
-    // Path param style
     `${base}/token-preview/${encodeURIComponent(tokenId)}`,
   ];
 
@@ -203,19 +172,11 @@ async function fetchTokenPreview(
       return await tryFetchJson(url);
     } catch (e) {
       lastError = coerceFetchError(e, "Failed to load token preview");
-
-      // If it is clearly "not found", keep trying other patterns.
       if (lastError.status && lastError.status !== 404) break;
     }
   }
 
-  if (lastError) {
-    // Throw as Error to preserve typical try/catch behavior up the stack
-    const err = new Error(lastError.message);
-    throw err;
-  }
-
-  throw new Error("Failed to load token preview");
+  throw new Error(lastError?.message || "Failed to load token preview");
 }
 
 function normalizeTokenStatus(data: TokenPreviewResponse) {
@@ -224,12 +185,38 @@ function normalizeTokenStatus(data: TokenPreviewResponse) {
   return { status, consumedAt };
 }
 
+function getQueryToken(
+  searchParams?: Record<string, string | string[] | undefined>
+) {
+  if (!searchParams) return null;
+
+  const pick = (key: string) => {
+    const v = searchParams[key];
+    if (typeof v === "string") return v;
+    if (Array.isArray(v) && typeof v[0] === "string") return v[0];
+    return null;
+  };
+
+  return pick("tokenId") ?? pick("token_id") ?? pick("id");
+}
+
 export default async function ReceiptTokenPage({
   params,
+  searchParams,
 }: {
-  params: { tokenId: string };
+  params: { tokenId?: string };
+  searchParams?: Record<string, string | string[] | undefined>;
 }) {
+  // Primary: /r/<tokenId>
   const tokenId = String(params?.tokenId || "").trim();
+
+  // Fallback: /r?tokenId=<uuid> (redirect to canonical /r/<uuid>)
+  if (!tokenId) {
+    const q = (getQueryToken(searchParams) || "").trim();
+    if (q && isValidUuid(q)) {
+      redirect(`/r/${q}`);
+    }
+  }
 
   // UUID validation
   if (!isValidUuid(tokenId)) {
