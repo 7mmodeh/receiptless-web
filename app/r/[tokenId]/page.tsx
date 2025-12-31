@@ -237,6 +237,7 @@ export default async function ReceiptTokenPage({
           <h1 style={styles.h1}>Invalid link</h1>
           <p style={styles.p}>
             This receipt link is not valid. Please check the URL and try again.
+            [DEPLOY-MARKER-2025-12-31-A]
           </p>
         </div>
       </main>
