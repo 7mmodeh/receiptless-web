@@ -4,6 +4,7 @@ import { redirect } from "next/navigation";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
+export const runtime = "nodejs";
 
 type ReceiptItem = {
   name?: string | null;
@@ -260,7 +261,6 @@ export default async function ReceiptTokenPage({
       <main style={styles.page}>
         <div style={styles.card}>
           <h1 style={styles.h1}>Invalid link</h1>
-          <p style={styles.p}>INVALID-LINK-MARKER__A9F2__DO-NOT-REMOVE</p>
           <p style={{ ...styles.p, marginTop: 10 }}>
             This receipt link is not valid. Please check the URL and try again.
           </p>
