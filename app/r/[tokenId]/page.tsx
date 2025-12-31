@@ -39,11 +39,16 @@ type FetchError = {
   status?: number;
 };
 
-const UUID_REGEX =
+// IMPORTANT: do NOT use /g here (global regex makes .test() stateful).
+const UUID_VALIDATE_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+// Extractor can be the same pattern without anchors.
+const UUID_EXTRACT_RE =
+  /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i;
+
 function isValidUuid(value: string) {
-  return UUID_REGEX.test(value);
+  return UUID_VALIDATE_RE.test(value);
 }
 
 function formatDateTime(iso?: string | null) {
@@ -112,7 +117,6 @@ function coerceFetchError(e: unknown, fallbackMessage: string): FetchError {
 }
 
 async function tryFetchJson(url: string): Promise<TokenPreviewResponse> {
-  // Add timeout so SSR never hangs
   const controller = new AbortController();
   const timeoutMs = 8000;
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -200,6 +204,22 @@ function getQueryToken(
   return pick("tokenId") ?? pick("token_id") ?? pick("id");
 }
 
+function normalizeIncomingToken(rawValue: string): string {
+  const raw = rawValue.trim();
+
+  // Decode defensively
+  let decoded = raw;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    // ignore
+  }
+
+  // Extract UUID substring if wrapped
+  const m = decoded.match(UUID_EXTRACT_RE);
+  return (m?.[0] ?? "").trim();
+}
+
 export default async function ReceiptTokenPage({
   params,
   searchParams,
@@ -208,28 +228,17 @@ export default async function ReceiptTokenPage({
   searchParams?: Record<string, string | string[] | undefined>;
 }) {
   // Primary: /r/<tokenId>
-  const raw = String(params?.tokenId || "").trim();
+  const tokenIdFromPath = normalizeIncomingToken(String(params?.tokenId ?? ""));
+  const tokenId = tokenIdFromPath;
 
-  // Decode defensively (won't throw if already decoded)
-  let decoded = raw;
-  try {
-    decoded = decodeURIComponent(raw);
-  } catch {
-    // ignore
-  }
-
-  // Extract the UUID substring (works even if token is wrapped or has extra chars)
-  const tokenId = decoded.match(UUID_REGEX)?.[0] ?? "";
-
-  // Fallback: /r?tokenId=<uuid> (redirect to canonical /r/<uuid>)
+  // Fallback: /r?tokenId=<uuid> -> redirect to canonical /r/<uuid>
   if (!tokenId) {
-    const q = (getQueryToken(searchParams) || "").trim();
+    const q = normalizeIncomingToken(String(getQueryToken(searchParams) ?? ""));
     if (q && isValidUuid(q)) {
       redirect(`/r/${q}`);
     }
   }
 
-  // UUID validation
   if (!isValidUuid(tokenId)) {
     return (
       <main style={styles.page}>
@@ -237,14 +246,11 @@ export default async function ReceiptTokenPage({
           <h1 style={styles.h1}>Invalid link</h1>
           <p style={styles.p}>
             This receipt link is not valid. Please check the URL and try again.
-            [DEPLOY-MARKER-2025-12-31-A]
           </p>
         </div>
       </main>
     );
   }
-
-  console.log("receiptless token params", { raw, decoded, tokenId });
 
   // Fetch data
   let data: TokenPreviewResponse | null = null;
