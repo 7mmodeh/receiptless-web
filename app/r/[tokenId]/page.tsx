@@ -252,7 +252,7 @@ export default async function ReceiptTokenPage({
     return (
       <main style={styles.page}>
         <div style={styles.card}>
-          <h1 style={styles.h1}>Invalid link</h1>
+          <h1 style={styles.h1}>INVALID-LINK-MARKER__A9F2__DO-NOT-REMOVE</h1>
           <p style={styles.p}>
             This receipt link is not valid. Please check the URL and try again.
           </p>
