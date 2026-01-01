@@ -1,7 +1,6 @@
-// app/(admin)/sim/web-pos/page.tsx
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   RealtimeChannel,
   RealtimeChannelSendResponse,
@@ -19,8 +18,6 @@ import { channelName, makeEvent, snapshotPayload } from "@/lib/posSimRealtime";
 const POS_SIM_ENABLED =
   (process.env.NEXT_PUBLIC_POS_SIM_ENABLED ?? "").toLowerCase() === "true" ||
   process.env.NEXT_PUBLIC_POS_SIM_ENABLED === "1";
-
-const supabase = getSupabaseClient();
 
 const DEMO_STORE_ID = "c3fde414-fdf9-4c50-aaea-004a10fe50ec";
 const DEMO_TERMINAL_CODE = "TEST-001";
@@ -47,7 +44,10 @@ async function safeSend(
 }
 
 export default function WebPosSimBootstrapPage() {
+  const supabase = useMemo(() => getSupabaseClient(), []);
+
   const [creating, setCreating] = useState(false);
+  const [hostStatus, setHostStatus] = useState<string>("Idle");
   const [session, setSession] = useState<{
     session_id: string;
     session_code: string;
@@ -56,6 +56,8 @@ export default function WebPosSimBootstrapPage() {
   } | null>(null);
 
   const channelRef = useRef<RealtimeChannel | null>(null);
+  const snapshotRef = useRef<PosSimSnapshot | null>(null);
+  const sessionIdRef = useRef<string | null>(null);
 
   const customerFullUrl = useMemo(() => {
     if (!session) return "";
@@ -63,10 +65,21 @@ export default function WebPosSimBootstrapPage() {
     return `${window.location.origin}${session.customer_url}`;
   }, [session]);
 
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      const ch = channelRef.current;
+      channelRef.current = null;
+      if (ch) supabase.removeChannel(ch);
+    };
+  }, [supabase]);
+
   async function startSession() {
     if (!POS_SIM_ENABLED) return;
 
     setCreating(true);
+    setHostStatus("Creating session...");
+
     try {
       const { data, error } = await supabase.functions.invoke(
         "pos-sim-create-session",
@@ -82,8 +95,9 @@ export default function WebPosSimBootstrapPage() {
       if (error) throw error;
 
       const d = data as unknown;
-      if (typeof d !== "object" || d === null)
+      if (typeof d !== "object" || d === null) {
         throw new Error("Invalid create-session response");
+      }
       const rd = d as Record<string, unknown>;
 
       const session_id =
@@ -101,53 +115,72 @@ export default function WebPosSimBootstrapPage() {
       const created = { session_id, session_code, customer_url, snapshot };
       setSession(created);
 
+      // Keep authoritative snapshot in a ref (important for re-sends and later A2 updates)
+      snapshotRef.current = created.snapshot;
+      sessionIdRef.current = created.session_id;
+
       // Cleanup existing channel if any
       if (channelRef.current) {
         supabase.removeChannel(channelRef.current);
         channelRef.current = null;
       }
 
+      setHostStatus("Connecting realtime...");
+
       const ch = supabase.channel(channelName(session_id), {
         config: { broadcast: { self: true } },
       });
-
       channelRef.current = ch;
 
       ch.on("broadcast", { event: "pos_sim" }, (msg: BroadcastMessage) => {
         const evUnknown = msg.payload;
         if (!isPosSimEvent(evUnknown)) return;
 
+        // DEBUG (optional):
+        // console.log("[host] event:", evUnknown.type, evUnknown);
+
         // If customer joined, re-send snapshot (host is authoritative)
         if (evUnknown.type === "CUSTOMER_JOINED") {
-          const snapEv = makeEvent(
-            "SNAPSHOT_SYNC",
-            session_id,
-            snapshotPayload(created.snapshot)
-          );
+          const sid = sessionIdRef.current;
+          const snap = snapshotRef.current;
+          if (!sid || !snap) return;
+
+          const snapEv = makeEvent("SNAPSHOT_SYNC", sid, snapshotPayload(snap));
+
           void safeSend(ch, snapEv);
         }
       });
 
-      await ch.subscribe(async (status: SubscribeStatus) => {
-        if (status !== "SUBSCRIBED") return;
+      // IMPORTANT: do NOT await subscribe; handle status via callback
+      ch.subscribe(async (st: SubscribeStatus) => {
+        if (st === "SUBSCRIBED") {
+          setHostStatus("Live");
 
-        const createdEv = makeEvent("SESSION_CREATED", session_id, {
-          session_code,
-          customer_url,
-        });
+          const createdEv = makeEvent("SESSION_CREATED", session_id, {
+            session_code,
+            customer_url,
+          });
 
-        const snapEv = makeEvent(
-          "SNAPSHOT_SYNC",
-          session_id,
-          snapshotPayload(created.snapshot)
-        );
+          const snap = snapshotRef.current ?? created.snapshot;
+          const snapEv = makeEvent(
+            "SNAPSHOT_SYNC",
+            session_id,
+            snapshotPayload(snap)
+          );
 
-        await safeSend(ch, createdEv);
-        await safeSend(ch, snapEv);
+          await safeSend(ch, createdEv);
+          await safeSend(ch, snapEv);
+          return;
+        }
+
+        if (st === "TIMED_OUT") setHostStatus("Realtime timed out");
+        if (st === "CHANNEL_ERROR") setHostStatus("Realtime channel error");
+        if (st === "CLOSED") setHostStatus("Realtime closed");
       });
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
-      console.error("Start session failed:", message);
+      console.error("Start session failed:", e);
+      setHostStatus(`Error: ${message}`);
       alert(message);
     } finally {
       setCreating(false);
@@ -174,6 +207,10 @@ export default function WebPosSimBootstrapPage() {
         Milestone A1: session creation, customer pairing by code, snapshot sync
         over Supabase Realtime.
       </p>
+
+      <div style={{ marginTop: 10, fontSize: 13, opacity: 0.85 }}>
+        Host Status: <b>{hostStatus}</b>
+      </div>
 
       {!session ? (
         <div style={{ marginTop: 20 }}>
@@ -229,6 +266,13 @@ export default function WebPosSimBootstrapPage() {
                 }}
               >
                 {customerFullUrl}
+              </div>
+
+              <div style={{ marginTop: 12, fontSize: 12, opacity: 0.7 }}>
+                Session ID
+              </div>
+              <div style={{ fontFamily: "monospace", fontSize: 12 }}>
+                {session.session_id}
               </div>
             </div>
 

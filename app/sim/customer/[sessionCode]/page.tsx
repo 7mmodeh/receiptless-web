@@ -1,4 +1,3 @@
-// app/(admin)/sim/customer/[sessionCode]/page.tsx
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -87,7 +86,7 @@ export default function CustomerDisplayPage() {
     async function fetchSnapshotByCode(code: string) {
       const { data, error } = await supabase
         .from("pos_sim_sessions")
-        .select("session_id, snapshot_json, expires_at, is_active")
+        .select("session_id, snapshot_json")
         .eq("session_code", code)
         .maybeSingle();
 
@@ -105,15 +104,14 @@ export default function CustomerDisplayPage() {
       setStatus("Loading session...");
 
       try {
-        // 1) Load session from DB (this must work for customer display)
         const { sid, snap } = await fetchSnapshotByCode(sessionCode);
 
         if (!mounted) return;
         setSessionId(sid);
         setSnapshot(snap);
-        setStatus("Subscribing...");
+        setStatus("Connecting realtime...");
 
-        // 2) Reset channel
+        // Reset channel
         if (channelRef.current) {
           supabase.removeChannel(channelRef.current);
           channelRef.current = null;
@@ -124,13 +122,8 @@ export default function CustomerDisplayPage() {
         });
         channelRef.current = ch;
 
-        // 3) Listen for broadcast events
         ch.on("broadcast", { event: "pos_sim" }, (msg: BroadcastMessage) => {
           const evUnknown = msg.payload;
-
-          // Helpful debug if needed (leave commented)
-          // console.log("[customer] broadcast:", evUnknown);
-
           if (!isPosSimEvent(evUnknown)) return;
 
           if (evUnknown.type === "SNAPSHOT_SYNC" && isSnapshotSync(evUnknown)) {
@@ -139,8 +132,8 @@ export default function CustomerDisplayPage() {
           }
         });
 
-        // 4) Subscribe & announce join
-        await ch.subscribe(async (st: SubscribeStatus) => {
+        // IMPORTANT: do NOT await subscribe; handle status via callback
+        ch.subscribe(async (st: SubscribeStatus) => {
           if (!mounted) return;
 
           if (st === "SUBSCRIBED") {
@@ -156,8 +149,7 @@ export default function CustomerDisplayPage() {
               payload: joinEv,
             });
 
-            // 5) Fallback: re-fetch snapshot once after join.
-            // This covers timing issues if host snapshot broadcast is missed.
+            // Optional safety: refresh snapshot once after join
             try {
               const refreshed = await fetchSnapshotByCode(sessionCode);
               if (mounted) {
@@ -165,7 +157,6 @@ export default function CustomerDisplayPage() {
                 setSnapshot(refreshed.snap);
               }
             } catch (e: unknown) {
-              // Do not fail UI due to fallback fetch; just surface status.
               if (mounted) setStatus(`Live (refresh warning): ${toStatus(e)}`);
             }
 
