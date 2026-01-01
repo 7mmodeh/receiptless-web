@@ -73,13 +73,21 @@ function extractDomain(url: string) {
 
 /**
  * POS Simulator (DEMO ONLY)
- * - This page is only for vendor showcase and internal experimentation.
- * - DO NOT expose real terminal keys to browser code (we don't).
- * - Calls /api/pos-sim/checkout-success which runs server-side.
+ * - Calls server route /api/pos-sim/checkout-success
+ * - Shows QR via global window.Receiptless host
+ * - Adds: Show again + Close buttons for vendor demos
  */
 export default function PosSimClient() {
   const [loading, setLoading] = useState(false);
   const [lastResult, setLastResult] = useState<ApiResult | null>(null);
+
+  // Tracks last successful QR parameters so we can "show again"
+  const [lastQrArgs, setLastQrArgs] = useState<{
+    token: string;
+    domain: string;
+    logoUrl: string;
+    title?: string;
+  } | null>(null);
 
   // Demo payload (edit values freely)
   const payload: ReceiptIngestPayload = useMemo(
@@ -121,6 +129,30 @@ export default function PosSimClient() {
     []
   );
 
+  function showQr(args: { token: string; public_url: string }) {
+    const domain = extractDomain(args.public_url);
+    const logoUrl = "https://receipt-less.com/brand/receiptless-logo.png";
+
+    const qrArgs = {
+      token: args.token,
+      domain,
+      logoUrl,
+      title: "Scan to save your receipt",
+    };
+
+    window.Receiptless?.showReceiptQR(qrArgs);
+    setLastQrArgs(qrArgs);
+  }
+
+  function closeQr() {
+    window.Receiptless?.hideReceiptQR?.();
+  }
+
+  function showAgain() {
+    if (!lastQrArgs) return;
+    window.Receiptless?.showReceiptQR(lastQrArgs);
+  }
+
   async function completeSale() {
     setLoading(true);
     setLastResult(null);
@@ -149,12 +181,10 @@ export default function PosSimClient() {
       }
 
       if (!res.ok) {
-        // If server returned a structured fallback, use it; otherwise force fallback.
         if (isApiFail(data)) {
           setLastResult(data);
           return;
         }
-
         const fail: ApiFail = {
           error: "POS Simulator: request failed",
           details: `HTTP ${res.status}`,
@@ -164,22 +194,13 @@ export default function PosSimClient() {
         return;
       }
 
-      // OK response: could still be fallback
       if (isApiFail(data)) {
         setLastResult(data);
         return;
       }
 
-      // Success
-      const domain = extractDomain(data.public_url);
-
-      window.Receiptless?.showReceiptQR({
-        token: data.token_id,
-        domain,
-        logoUrl: "https://receipt-less.com/brand/receiptless-logo.png",
-        title: "Scan to save your receipt",
-      });
-
+      // Success → show QR + store last args
+      showQr({ token: data.token_id, public_url: data.public_url });
       setLastResult(data);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -194,6 +215,8 @@ export default function PosSimClient() {
     }
   }
 
+  const canShowAgain = Boolean(lastQrArgs?.token);
+
   return (
     <main style={styles.page}>
       <div style={styles.card}>
@@ -201,19 +224,46 @@ export default function PosSimClient() {
           <div>
             <h1 style={styles.h1}>POS Simulator</h1>
             <div style={styles.subtle}>
-              Demo-only. Simulates payment success → issues token → shows QR →
-              customer scans.
+              Demo-only. Complete a sale → issue token → show QR → customer
+              scans.
             </div>
           </div>
 
-          <button
-            type="button"
-            onClick={completeSale}
-            disabled={loading}
-            style={{ ...styles.primaryBtn, opacity: loading ? 0.6 : 1 }}
-          >
-            {loading ? "Processing…" : "Complete Sale"}
-          </button>
+          <div style={styles.actions}>
+            <button
+              type="button"
+              onClick={showAgain}
+              disabled={!canShowAgain}
+              style={{
+                ...styles.secondaryBtn,
+                opacity: canShowAgain ? 1 : 0.5,
+                cursor: canShowAgain ? "pointer" : "not-allowed",
+              }}
+              title={
+                canShowAgain ? "Reopen last QR" : "No successful token yet"
+              }
+            >
+              Show QR again
+            </button>
+
+            <button
+              type="button"
+              onClick={closeQr}
+              style={styles.secondaryBtn}
+              title="Close QR modal"
+            >
+              Close QR
+            </button>
+
+            <button
+              type="button"
+              onClick={completeSale}
+              disabled={loading}
+              style={{ ...styles.primaryBtn, opacity: loading ? 0.6 : 1 }}
+            >
+              {loading ? "Processing…" : "Complete Sale"}
+            </button>
+          </div>
         </div>
 
         <div style={styles.divider} />
@@ -242,7 +292,7 @@ export default function PosSimClient() {
                 {lastResult.details ? ` — ${lastResult.details}` : ""}
               </div>
               <div style={{ marginTop: 10, fontSize: 12.5, opacity: 0.85 }}>
-                In real POS: call ESC/POS print here.
+                In a real POS: call ESC/POS print here.
               </div>
             </div>
           ) : (
@@ -263,8 +313,7 @@ export default function PosSimClient() {
                 </a>
               </div>
               <div style={{ marginTop: 10, fontSize: 12.5, opacity: 0.85 }}>
-                QR modal should be visible now. If not, confirm
-                ReceiptlessQrHost is mounted in app/layout.tsx.
+                Use “Show QR again” for quick re-open during a vendor demo.
               </div>
             </div>
           )}
@@ -296,6 +345,14 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: "flex-start",
     justifyContent: "space-between",
     gap: 12,
+    flexWrap: "wrap",
+  },
+  actions: {
+    display: "flex",
+    gap: 10,
+    alignItems: "center",
+    justifyContent: "flex-end",
+    flexWrap: "wrap",
   },
   h1: {
     margin: 0,
@@ -343,6 +400,21 @@ const styles: Record<string, React.CSSProperties> = {
     color: "#ffffff",
     background: "#111827",
     border: "1px solid rgba(0,0,0,0.08)",
+    whiteSpace: "nowrap",
+    cursor: "pointer",
+  },
+  secondaryBtn: {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    height: 40,
+    padding: "0 14px",
+    borderRadius: 10,
+    fontSize: 13.5,
+    fontWeight: 800,
+    color: "rgba(0,0,0,0.85)",
+    background: "#ffffff",
+    border: "1px solid rgba(0,0,0,0.12)",
     whiteSpace: "nowrap",
     cursor: "pointer",
   },
