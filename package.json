@@ -9,6 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.89.0",
     "code": "^5.2.4",
     "express": "^5.2.1",
     "next": "16.1.1",
@@ -17,7 +18,8 @@
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "react-native-qrcode-svg": "^6.3.21",
-    "react-native-svg": "^15.15.1"
+    "react-native-svg": "^15.15.1",
+    "supabase": "^2.70.5"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
