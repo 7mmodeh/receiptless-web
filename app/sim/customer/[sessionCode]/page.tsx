@@ -18,7 +18,29 @@ const POS_SIM_ENABLED =
   (process.env.NEXT_PUBLIC_POS_SIM_ENABLED ?? "").toLowerCase() === "true" ||
   process.env.NEXT_PUBLIC_POS_SIM_ENABLED === "1";
 
-const supabase = getSupabaseClient();
+type SubscribeStatus = "SUBSCRIBED" | "TIMED_OUT" | "CLOSED" | "CHANNEL_ERROR";
+
+function toStatus(v: unknown): string {
+  if (typeof v === "string") return v;
+  if (v instanceof Error) return v.message;
+  if (typeof v === "object" && v !== null) {
+    const r = v as Record<string, unknown>;
+    const message = typeof r.message === "string" ? r.message : null;
+    const details = typeof r.details === "string" ? r.details : null;
+    const hint = typeof r.hint === "string" ? r.hint : null;
+
+    if (message || details || hint) {
+      return [message, details, hint].filter(Boolean).join(" | ");
+    }
+
+    try {
+      return JSON.stringify(v);
+    } catch {
+      return String(v);
+    }
+  }
+  return String(v);
+}
 
 function isPosSimEvent(v: unknown): v is PosSimEvent {
   if (typeof v !== "object" || v === null) return false;
@@ -39,9 +61,9 @@ function isSnapshotSync(
   return typeof p.snapshot === "object" && p.snapshot !== null;
 }
 
-type SubscribeStatus = "SUBSCRIBED" | "TIMED_OUT" | "CLOSED" | "CHANNEL_ERROR";
-
 export default function CustomerDisplayPage() {
+  const supabase = useMemo(() => getSupabaseClient(), []);
+
   const params = useParams<{ sessionCode: string }>();
   const sessionCode = String(params.sessionCode ?? "").trim();
 
@@ -62,29 +84,36 @@ export default function CustomerDisplayPage() {
 
     let mounted = true;
 
+    async function fetchSnapshotByCode(code: string) {
+      const { data, error } = await supabase
+        .from("pos_sim_sessions")
+        .select("session_id, snapshot_json, expires_at, is_active")
+        .eq("session_code", code)
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!data?.session_id) throw new Error("Session not found or expired");
+
+      return {
+        sid: String(data.session_id),
+        snap: data.snapshot_json as PosSimSnapshot,
+      };
+    }
+
     async function run() {
       setLoading(true);
       setStatus("Loading session...");
 
       try {
-        const { data, error } = await supabase
-          .from("pos_sim_sessions")
-          .select("session_id, snapshot_json")
-          .eq("session_code", sessionCode)
-          .maybeSingle();
-
-        if (error) throw error;
-        if (!data?.session_id) throw new Error("Session not found or expired");
-
-        const sid = String(data.session_id);
-        const snap = data.snapshot_json as PosSimSnapshot;
+        // 1) Load session from DB (this must work for customer display)
+        const { sid, snap } = await fetchSnapshotByCode(sessionCode);
 
         if (!mounted) return;
-
         setSessionId(sid);
         setSnapshot(snap);
         setStatus("Subscribing...");
 
+        // 2) Reset channel
         if (channelRef.current) {
           supabase.removeChannel(channelRef.current);
           channelRef.current = null;
@@ -95,8 +124,13 @@ export default function CustomerDisplayPage() {
         });
         channelRef.current = ch;
 
+        // 3) Listen for broadcast events
         ch.on("broadcast", { event: "pos_sim" }, (msg: BroadcastMessage) => {
           const evUnknown = msg.payload;
+
+          // Helpful debug if needed (leave commented)
+          // console.log("[customer] broadcast:", evUnknown);
+
           if (!isPosSimEvent(evUnknown)) return;
 
           if (evUnknown.type === "SNAPSHOT_SYNC" && isSnapshotSync(evUnknown)) {
@@ -105,26 +139,50 @@ export default function CustomerDisplayPage() {
           }
         });
 
+        // 4) Subscribe & announce join
         await ch.subscribe(async (st: SubscribeStatus) => {
-          if (st !== "SUBSCRIBED") return;
+          if (!mounted) return;
 
-          setStatus("Live");
+          if (st === "SUBSCRIBED") {
+            setStatus("Live");
 
-          const joinEv = makeEvent("CUSTOMER_JOINED", sid, {
-            session_code: sessionCode,
-          } satisfies JsonObject);
+            const joinEv = makeEvent("CUSTOMER_JOINED", sid, {
+              session_code: sessionCode,
+            } satisfies JsonObject);
 
-          await ch.send({
-            type: "broadcast",
-            event: "pos_sim",
-            payload: joinEv,
-          });
+            await ch.send({
+              type: "broadcast",
+              event: "pos_sim",
+              payload: joinEv,
+            });
+
+            // 5) Fallback: re-fetch snapshot once after join.
+            // This covers timing issues if host snapshot broadcast is missed.
+            try {
+              const refreshed = await fetchSnapshotByCode(sessionCode);
+              if (mounted) {
+                setSessionId(refreshed.sid);
+                setSnapshot(refreshed.snap);
+              }
+            } catch (e: unknown) {
+              // Do not fail UI due to fallback fetch; just surface status.
+              if (mounted) setStatus(`Live (refresh warning): ${toStatus(e)}`);
+            }
+
+            return;
+          }
+
+          if (st === "TIMED_OUT") setStatus("Realtime timed out");
+          if (st === "CHANNEL_ERROR") setStatus("Realtime channel error");
+          if (st === "CLOSED") setStatus("Realtime closed");
         });
       } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        console.error("Customer display load failed:", msg);
+        const msg = toStatus(e);
+        console.error("Customer display load failed:", e);
         if (!mounted) return;
         setStatus(msg);
+        setSnapshot(null);
+        setSessionId(null);
       } finally {
         if (!mounted) return;
         setLoading(false);
@@ -139,7 +197,7 @@ export default function CustomerDisplayPage() {
       channelRef.current = null;
       if (ch) supabase.removeChannel(ch);
     };
-  }, [sessionCode]);
+  }, [sessionCode, supabase]);
 
   if (!POS_SIM_ENABLED) {
     return (
@@ -200,7 +258,8 @@ export default function CustomerDisplayPage() {
 
         {!loading && !snapshot && (
           <div style={{ fontSize: 14, opacity: 0.85 }}>
-            No snapshot loaded. Session may be expired.
+            No snapshot loaded. Session may be expired or access is blocked
+            (check Status above).
           </div>
         )}
 
