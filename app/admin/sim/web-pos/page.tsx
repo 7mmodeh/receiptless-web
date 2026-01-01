@@ -7,7 +7,7 @@ import type {
   RealtimeChannelSendResponse,
 } from "@supabase/supabase-js";
 
-import { supabase } from "@/lib/supabaseClient";
+import { getSupabaseClient } from "@/lib/supabaseClient";
 import type {
   BroadcastMessage,
   JsonObject,
@@ -19,6 +19,8 @@ import { channelName, makeEvent, snapshotPayload } from "@/lib/posSimRealtime";
 const POS_SIM_ENABLED =
   (process.env.NEXT_PUBLIC_POS_SIM_ENABLED ?? "").toLowerCase() === "true" ||
   process.env.NEXT_PUBLIC_POS_SIM_ENABLED === "1";
+
+const supabase = getSupabaseClient();
 
 const DEMO_STORE_ID = "c3fde414-fdf9-4c50-aaea-004a10fe50ec";
 const DEMO_TERMINAL_CODE = "TEST-001";

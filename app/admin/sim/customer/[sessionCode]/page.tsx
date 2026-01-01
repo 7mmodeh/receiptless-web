@@ -5,7 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 
-import { supabase } from "@/lib/supabaseClient";
+import { getSupabaseClient } from "@/lib/supabaseClient";
 import type {
   BroadcastMessage,
   JsonObject,
@@ -17,6 +17,8 @@ import { channelName, makeEvent } from "@/lib/posSimRealtime";
 const POS_SIM_ENABLED =
   (process.env.NEXT_PUBLIC_POS_SIM_ENABLED ?? "").toLowerCase() === "true" ||
   process.env.NEXT_PUBLIC_POS_SIM_ENABLED === "1";
+
+const supabase = getSupabaseClient();
 
 function isPosSimEvent(v: unknown): v is PosSimEvent {
   if (typeof v !== "object" || v === null) return false;
