@@ -87,8 +87,8 @@ export type PosSimSnapshot = {
 export type PosSimEventType =
   | "SESSION_CREATED"
   | "CUSTOMER_JOINED"
-  | "SNAPSHOT_SYNC"
   | "CART_UPDATED"
+  | "SNAPSHOT_SYNC"
   | "RESET_REQUESTED";
 
 /**

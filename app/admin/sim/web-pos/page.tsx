@@ -75,7 +75,6 @@ function nextLineNo(items: CartItem[]) {
 }
 
 function newSaleId() {
-  // Works in modern browsers; fallback to timestamp if needed
   try {
     return crypto.randomUUID();
   } catch {
@@ -83,7 +82,13 @@ function newSaleId() {
   }
 }
 
-export default function WebPosSimPageA3() {
+function cartIsEmpty(snap: PosSimSnapshot) {
+  return (
+    (snap.cart.items ?? []).length === 0 || Number(snap.cart.total ?? 0) <= 0
+  );
+}
+
+export default function WebPosSimPageA4() {
   const supabase = useMemo(() => getSupabaseClient(), []);
 
   const [creating, setCreating] = useState(false);
@@ -99,14 +104,18 @@ export default function WebPosSimPageA3() {
   const snapshotRef = useRef<PosSimSnapshot | null>(null);
   const sessionIdRef = useRef<string | null>(null);
 
-  // For simulating async payment processing
   const payTimerRef = useRef<number | null>(null);
+  const issuingRef = useRef(false);
 
   const customerFullUrl = useMemo(() => {
     if (!session) return "";
     if (typeof window === "undefined") return session.customer_url;
     return `${window.location.origin}${session.customer_url}`;
   }, [session]);
+
+  function getSnap(): PosSimSnapshot | null {
+    return snapshotRef.current ?? session?.snapshot ?? null;
+  }
 
   useEffect(() => {
     return () => {
@@ -139,21 +148,10 @@ export default function WebPosSimPageA3() {
       setHostStatus(`DB update failed: ${upErr.message}`);
     }
 
-    // A2/A3: broadcast cart update + snapshot sync
     const cartEv = makeEvent("CART_UPDATED", sid, snapshotPayload(nextSnap));
     const snapEv = makeEvent("SNAPSHOT_SYNC", sid, snapshotPayload(nextSnap));
     await safeSend(ch, cartEv);
     await safeSend(ch, snapEv);
-  }
-
-  function getSnap(): PosSimSnapshot | null {
-    return snapshotRef.current ?? session?.snapshot ?? null;
-  }
-
-  function cartIsEmpty(snap: PosSimSnapshot) {
-    return (
-      (snap.cart.items ?? []).length === 0 || Number(snap.cart.total ?? 0) <= 0
-    );
   }
 
   async function startSession() {
@@ -210,7 +208,6 @@ export default function WebPosSimPageA3() {
         const evUnknown = msg.payload;
         if (!isPosSimEvent(evUnknown)) return;
 
-        // Host is authoritative: if customer joins, re-send snapshot
         if (evUnknown.type === "CUSTOMER_JOINED") {
           const sid = sessionIdRef.current;
           const snap = snapshotRef.current;
@@ -259,8 +256,6 @@ export default function WebPosSimPageA3() {
     if (!session) return;
     const snap = getSnap();
     if (!snap) return;
-
-    // block edits during processing/result for realism (optional)
     if (snap.flow.stage === "PROCESSING") return;
 
     const items = [...(snap.cart.items ?? [])];
@@ -308,11 +303,9 @@ export default function WebPosSimPageA3() {
     if (!session) return;
     const snap = getSnap();
     if (!snap) return;
-
     if (snap.flow.stage === "PROCESSING") return;
 
     const items = [...(snap.cart.items ?? [])];
-
     const idx = items.findIndex((i) => i.line_no === line_no);
     if (idx < 0) return;
 
@@ -340,11 +333,9 @@ export default function WebPosSimPageA3() {
     if (!session) return;
     const snap = getSnap();
     if (!snap) return;
-
     if (snap.flow.stage === "PROCESSING") return;
 
     const items = [...(snap.cart.items ?? [])];
-
     const it = items.find((i) => i.line_no === line_no);
     if (!it) return;
 
@@ -366,7 +357,6 @@ export default function WebPosSimPageA3() {
     if (!session) return;
     const snap = getSnap();
     if (!snap) return;
-
     if (snap.flow.stage === "PROCESSING") return;
 
     const nextSnap: PosSimSnapshot = {
@@ -420,8 +410,6 @@ export default function WebPosSimPageA3() {
   function backToCart() {
     const snap = getSnap();
     if (!snap) return;
-
-    // If in PROCESSING, block back for realism
     if (snap.flow.stage === "PROCESSING") return;
 
     const nextSnap: PosSimSnapshot = {
@@ -436,6 +424,8 @@ export default function WebPosSimPageA3() {
   function newSale() {
     const snap = getSnap();
     if (!snap) return;
+
+    issuingRef.current = false;
 
     if (payTimerRef.current) {
       window.clearTimeout(payTimerRef.current);
@@ -471,18 +461,18 @@ export default function WebPosSimPageA3() {
     }
 
     if (snap.flow.stage !== "CHECKOUT" && snap.flow.stage !== "CART") {
-      // allow pay only from checkout for cleanliness
       setHostStatus("Go to checkout first");
       return;
     }
 
-    // Cancel any pending timer
     if (payTimerRef.current) {
       window.clearTimeout(payTimerRef.current);
       payTimerRef.current = null;
     }
 
-    // Immediate NETWORK_ERROR if network is down
+    // Reset receipt issuance state on new pay attempt
+    issuingRef.current = false;
+
     if (snap.toggles.network_mode === "down") {
       const nextSnap: PosSimSnapshot = {
         ...snap,
@@ -493,20 +483,23 @@ export default function WebPosSimPageA3() {
       return;
     }
 
-    // Move to processing
     const processingSnap: PosSimSnapshot = {
       ...snap,
-      flow: { ...snap.flow, stage: "PROCESSING", payment_state: "PROCESSING" },
+      receipt: null,
+      fallback: { printed: false, print_reason: null },
+      flow: {
+        ...snap.flow,
+        stage: "PROCESSING",
+        payment_state: "PROCESSING",
+        issuance_state: "IDLE",
+      },
     };
+
     setHostStatus("Processing payment...");
     void persistAndBroadcast(processingSnap);
 
     const slow = snap.toggles.network_mode === "slow";
-
-    // Determine delay + final outcome
     const baseDelay = slow ? 3500 : 1500;
-
-    // Timeout should feel longer
     const delay =
       snap.toggles.payment_outcome === "timeout"
         ? slow
@@ -517,12 +510,9 @@ export default function WebPosSimPageA3() {
     payTimerRef.current = window.setTimeout(() => {
       const latest = getSnap();
       if (!latest) return;
-
-      // If user started a new sale mid-flight, ignore
       if (latest.flow.stage !== "PROCESSING") return;
 
       let finalState: PosSimSnapshot["flow"]["payment_state"] = "APPROVED";
-
       if (latest.toggles.payment_outcome === "fail") finalState = "DECLINED";
       if (latest.toggles.payment_outcome === "timeout") finalState = "TIMEOUT";
 
@@ -543,6 +533,135 @@ export default function WebPosSimPageA3() {
     }, delay);
   }
 
+  async function issueReceipt() {
+    const snap = getSnap();
+    if (!snap) return;
+
+    if (snap.flow.payment_state !== "APPROVED") {
+      setHostStatus("Receipt issuance requires APPROVED payment");
+      return;
+    }
+
+    if (snap.flow.issuance_state === "INGESTING") return;
+    if (issuingRef.current) return;
+
+    issuingRef.current = true;
+
+    const ingestingSnap: PosSimSnapshot = {
+      ...snap,
+      flow: { ...snap.flow, issuance_state: "INGESTING" },
+      receipt: null,
+    };
+
+    setHostStatus("Issuing receipt (real receipt-ingest)...");
+    await persistAndBroadcast(ingestingSnap);
+
+    // Build payload aligned with your receipt-ingest edge function
+    const payload = {
+      retailer_id: snap.terminal.retailer_id,
+      store_id: snap.terminal.store_id,
+      terminal_code: snap.terminal.terminal_code,
+
+      issued_at: new Date().toISOString(),
+      receipt_number: null,
+
+      currency: snap.cart.currency ?? "EUR",
+      subtotal: Number(snap.cart.subtotal ?? 0),
+      vat_total: Number(snap.cart.vat_total ?? 0),
+      total: Number(snap.cart.total ?? 0),
+
+      items: (snap.cart.items ?? []).map((i) => ({
+        line_no: i.line_no,
+        sku: i.sku ?? null,
+        name: i.name,
+        qty: Number(i.qty),
+        unit_price: Number(i.unit_price),
+        line_total: Number(i.line_total),
+        vat_rate: i.vat_rate ?? null,
+        vat_amount: i.vat_amount ?? null,
+      })),
+    };
+
+    try {
+      const res = await fetch("/api/pos-sim/issue-receipt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      const out = (await res.json().catch(() => null)) as Record<
+        string,
+        unknown
+      > | null;
+
+      if (!res.ok) {
+        const details = out?.details ?? out ?? { status: res.status };
+        throw new Error(
+          typeof details === "string" ? details : JSON.stringify(details)
+        );
+      }
+
+      const token_id = typeof out?.token_id === "string" ? out.token_id : null;
+      const public_url =
+        typeof out?.public_url === "string" ? out.public_url : null;
+      const qr_url = typeof out?.qr_url === "string" ? out.qr_url : public_url;
+      const preview_url =
+        typeof out?.preview_url === "string" || out?.preview_url === null
+          ? (out.preview_url as string | null)
+          : null;
+
+      if (!token_id || !public_url)
+        throw new Error("Invalid receipt-ingest response shape");
+
+      const nextSnap: PosSimSnapshot = {
+        ...getSnap()!,
+        flow: { ...getSnap()!.flow, issuance_state: "TOKEN_READY" },
+        receipt: {
+          token_id,
+          public_url,
+          qr_url: qr_url ?? public_url,
+          preview_url,
+        },
+      };
+
+      setHostStatus("Receipt token ready");
+      await persistAndBroadcast(nextSnap);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+
+      const failedSnap: PosSimSnapshot = {
+        ...getSnap()!,
+        flow: { ...getSnap()!.flow, issuance_state: "FAILED" },
+      };
+
+      setHostStatus(`Receipt issuance failed: ${msg}`);
+      await persistAndBroadcast(failedSnap);
+    } finally {
+      issuingRef.current = false;
+    }
+  }
+
+  // Auto-issue receipt once when payment is approved
+  useEffect(() => {
+    const snap = getSnap();
+    if (!snap) return;
+
+    const shouldAuto =
+      snap.flow.stage === "RESULT" &&
+      snap.flow.payment_state === "APPROVED" &&
+      snap.flow.issuance_state === "IDLE" &&
+      !snap.receipt;
+
+    if (!shouldAuto) return;
+
+    void issueReceipt();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    session?.snapshot?.flow?.stage,
+    session?.snapshot?.flow?.payment_state,
+    session?.snapshot?.flow?.issuance_state,
+  ]);
+
   if (!POS_SIM_ENABLED) {
     return (
       <div style={{ padding: 24 }}>
@@ -555,18 +674,17 @@ export default function WebPosSimPageA3() {
   }
 
   const snap = session?.snapshot ?? null;
-
   const stage = snap?.flow.stage ?? "BOOT";
   const payState = snap?.flow.payment_state ?? "IDLE";
+  const issuanceState = snap?.flow.issuance_state ?? "IDLE";
 
   return (
     <div style={{ padding: 24, maxWidth: 1040 }}>
       <h1 style={{ fontSize: 22, fontWeight: 800 }}>
-        Receiptless POS Simulator — Web POS (A3)
+        Receiptless POS Simulator — Web POS (A4)
       </h1>
       <p style={{ marginTop: 8 }}>
-        Milestone A3: Checkout + payment outcomes (success/fail/timeout +
-        network modes).
+        Milestone A4: real receipt-ingest + real token + customer QR.
       </p>
 
       <div style={{ marginTop: 10, fontSize: 13, opacity: 0.85 }}>
@@ -597,11 +715,11 @@ export default function WebPosSimPageA3() {
         <div
           style={{ marginTop: 18, display: "flex", gap: 16, flexWrap: "wrap" }}
         >
-          {/* Left column: session + toggles + catalog */}
+          {/* Left column */}
           <div
             style={{
               flex: 1,
-              minWidth: 340,
+              minWidth: 360,
               border: "1px solid #ddd",
               borderRadius: 12,
               padding: 14,
@@ -629,6 +747,10 @@ export default function WebPosSimPageA3() {
                   Payment
                 </div>
                 <div style={{ fontWeight: 900 }}>{payState}</div>
+                <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
+                  Issuance
+                </div>
+                <div style={{ fontWeight: 900 }}>{issuanceState}</div>
               </div>
             </div>
 
@@ -738,11 +860,11 @@ export default function WebPosSimPageA3() {
             </div>
           </div>
 
-          {/* Right column: cart + actions */}
+          {/* Right column */}
           <div
             style={{
-              flex: 1.4,
-              minWidth: 520,
+              flex: 1.5,
+              minWidth: 560,
               border: "1px solid #ddd",
               borderRadius: 12,
               padding: 14,
@@ -852,6 +974,34 @@ export default function WebPosSimPageA3() {
                 }}
               >
                 Pay
+              </button>
+
+              <button
+                onClick={issueReceipt}
+                disabled={
+                  !snap ||
+                  payState !== "APPROVED" ||
+                  issuanceState === "INGESTING" ||
+                  issuanceState === "TOKEN_READY"
+                }
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #0a7",
+                  background: "white",
+                  fontWeight: 900,
+                  opacity:
+                    !snap ||
+                    payState !== "APPROVED" ||
+                    issuanceState === "INGESTING" ||
+                    issuanceState === "TOKEN_READY"
+                      ? 0.6
+                      : 1,
+                }}
+              >
+                {issuanceState === "INGESTING"
+                  ? "Issuing..."
+                  : "Issue Receipt (Real)"}
               </button>
             </div>
 
@@ -978,30 +1128,42 @@ export default function WebPosSimPageA3() {
               </div>
             </div>
 
-            {/* Result hint */}
-            {stage === "RESULT" && (
-              <div
-                style={{
-                  marginTop: 14,
-                  padding: 12,
-                  borderRadius: 12,
-                  border: "1px solid #eee",
-                  background: "white",
-                }}
-              >
-                <div style={{ fontWeight: 900 }}>Payment Result</div>
-                <div style={{ marginTop: 6, opacity: 0.85 }}>
-                  {payState === "APPROVED" &&
-                    "Approved — next milestone will issue the real receipt token."}
-                  {payState === "DECLINED" &&
-                    "Declined — adjust outcome toggle or try again."}
-                  {payState === "TIMEOUT" &&
-                    "Timeout — adjust outcome toggle or try again."}
-                  {payState === "NETWORK_ERROR" &&
-                    "Network error — set Network Mode back to Normal/Slow."}
+            {/* Receipt panel */}
+            <div style={{ marginTop: 14 }}>
+              <div style={{ fontWeight: 900 }}>Receipt</div>
+              {issuanceState === "IDLE" && (
+                <div style={{ opacity: 0.8, marginTop: 6 }}>
+                  Not issued yet.
                 </div>
-              </div>
-            )}
+              )}
+              {issuanceState === "INGESTING" && (
+                <div style={{ opacity: 0.8, marginTop: 6 }}>
+                  Issuing receipt...
+                </div>
+              )}
+              {issuanceState === "FAILED" && (
+                <div style={{ opacity: 0.85, marginTop: 6 }}>
+                  Issuance failed. You can retry with{" "}
+                  <b>Issue Receipt (Real)</b>.
+                </div>
+              )}
+              {issuanceState === "TOKEN_READY" && snap?.receipt && (
+                <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>Public URL</div>
+                  <a
+                    href={snap.receipt.public_url}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    {snap.receipt.public_url}
+                  </a>
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>Token</div>
+                  <div style={{ fontFamily: "monospace" }}>
+                    {snap.receipt.token_id}
+                  </div>
+                </div>
+              )}
+            </div>
 
             {/* Debug */}
             <div style={{ marginTop: 14, fontSize: 12, opacity: 0.7 }}>

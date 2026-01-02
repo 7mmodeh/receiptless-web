@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import type { RealtimeChannel } from "@supabase/supabase-js";
-
+import Image from "next/image";
 import { getSupabaseClient } from "@/lib/supabaseClient";
 import type {
   BroadcastMessage,
@@ -27,10 +27,8 @@ function toStatus(v: unknown): string {
     const message = typeof r.message === "string" ? r.message : null;
     const details = typeof r.details === "string" ? r.details : null;
     const hint = typeof r.hint === "string" ? r.hint : null;
-
     if (message || details || hint)
       return [message, details, hint].filter(Boolean).join(" | ");
-
     try {
       return JSON.stringify(v);
     } catch {
@@ -52,11 +50,18 @@ function isPosSimEvent(v: unknown): v is PosSimEvent {
   );
 }
 
-function isSnapshotPayload(
+function isSnapshotSync(
   ev: PosSimEvent
 ): ev is PosSimEvent & { payload: { snapshot: PosSimSnapshot } } {
   const p = ev.payload as Record<string, unknown>;
   return typeof p.snapshot === "object" && p.snapshot !== null;
+}
+
+function makeQrUrl(data: string) {
+  // Google chart QR (fast + no deps)
+  return `https://www.google.com/chart?chs=300x300&cht=qr&chl=${encodeURIComponent(
+    data
+  )}`;
 }
 
 export default function CustomerDisplayPage() {
@@ -110,7 +115,6 @@ export default function CustomerDisplayPage() {
         setSnapshot(snap);
         setStatus("Connecting realtime...");
 
-        // Reset channel
         if (channelRef.current) {
           supabase.removeChannel(channelRef.current);
           channelRef.current = null;
@@ -125,12 +129,7 @@ export default function CustomerDisplayPage() {
           const evUnknown = msg.payload;
           if (!isPosSimEvent(evUnknown)) return;
 
-          // A2: accept both SNAPSHOT_SYNC + CART_UPDATED payloads
-          if (
-            (evUnknown.type === "SNAPSHOT_SYNC" ||
-              evUnknown.type === "CART_UPDATED") &&
-            isSnapshotPayload(evUnknown)
-          ) {
+          if (evUnknown.type === "SNAPSHOT_SYNC" && isSnapshotSync(evUnknown)) {
             setSnapshot(evUnknown.payload.snapshot);
             setStatus("Live");
           }
@@ -144,7 +143,7 @@ export default function CustomerDisplayPage() {
 
             const joinEv = makeEvent("CUSTOMER_JOINED", sid, {
               session_code: sessionCode,
-            } as unknown as JsonObject);
+            } satisfies JsonObject);
 
             await ch.send({
               type: "broadcast",
@@ -152,7 +151,7 @@ export default function CustomerDisplayPage() {
               payload: joinEv,
             });
 
-            // Refresh snapshot once after join (covers missed broadcasts)
+            // Safety refresh
             try {
               const refreshed = await fetchSnapshotByCode(sessionCode);
               if (mounted) {
@@ -204,11 +203,7 @@ export default function CustomerDisplayPage() {
     );
   }
 
-  const currency = snapshot?.cart.currency ?? "EUR";
-  const items = snapshot?.cart.items ?? [];
-  const subtotal = Number(snapshot?.cart.subtotal ?? 0);
-  const vatTotal = Number(snapshot?.cart.vat_total ?? 0);
-  const total = Number(snapshot?.cart.total ?? 0);
+  const receiptUrl = snapshot?.receipt?.public_url ?? null;
 
   return (
     <div
@@ -306,75 +301,75 @@ export default function CustomerDisplayPage() {
               >
                 <div style={{ fontSize: 12, opacity: 0.7 }}>Total</div>
                 <div style={{ fontSize: 34, fontWeight: 900 }}>
-                  {currency} {total.toFixed(2)}
+                  {snapshot.cart.currency}{" "}
+                  {Number(snapshot.cart.total ?? 0).toFixed(2)}
                 </div>
+                <div style={{ marginTop: 8, fontSize: 13, opacity: 0.85 }}>
+                  {receiptUrl
+                    ? "Scan the QR to receive your receipt."
+                    : "Waiting for receipt issuance."}
+                </div>
+              </div>
+            </div>
 
+            {/* Receipt panel */}
+            <div
+              style={{
+                marginTop: 16,
+                padding: 14,
+                border: "1px solid #eee",
+                borderRadius: 12,
+              }}
+            >
+              <div style={{ fontWeight: 900, fontSize: 14 }}>Your Receipt</div>
+
+              {!receiptUrl ? (
+                <div style={{ marginTop: 8, opacity: 0.85 }}>
+                  {snapshot.flow.payment_state === "APPROVED"
+                    ? "Payment approved. Issuing receipt…"
+                    : "Complete payment to generate your receipt."}
+                </div>
+              ) : (
                 <div
                   style={{
                     marginTop: 10,
                     display: "flex",
-                    justifyContent: "space-between",
+                    gap: 14,
+                    flexWrap: "wrap",
+                    alignItems: "center",
                   }}
                 >
-                  <div style={{ opacity: 0.75 }}>Subtotal</div>
-                  <div style={{ fontWeight: 800 }}>
-                    {currency} {subtotal.toFixed(2)}
-                  </div>
-                </div>
-
-                <div
-                  style={{
-                    marginTop: 6,
-                    display: "flex",
-                    justifyContent: "space-between",
-                  }}
-                >
-                  <div style={{ opacity: 0.75 }}>VAT</div>
-                  <div style={{ fontWeight: 800 }}>
-                    {currency} {vatTotal.toFixed(2)}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div style={{ marginTop: 14, fontSize: 14, fontWeight: 900 }}>
-              Items
-            </div>
-
-            {items.length === 0 ? (
-              <div style={{ marginTop: 8, fontSize: 13, opacity: 0.85 }}>
-                Waiting for items…
-              </div>
-            ) : (
-              <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
-                {items.map((it) => (
-                  <div
-                    key={it.line_no}
-                    style={{
-                      border: "1px solid #eee",
-                      borderRadius: 12,
-                      padding: 12,
-                      display: "flex",
-                      justifyContent: "space-between",
-                      gap: 10,
-                      alignItems: "center",
-                    }}
-                  >
-                    <div style={{ flex: 1 }}>
-                      <div style={{ fontWeight: 900 }}>{it.name}</div>
-                      <div style={{ fontSize: 12, opacity: 0.75 }}>
-                        {it.sku ?? "—"} · {it.qty} × {currency}{" "}
-                        {Number(it.unit_price ?? 0).toFixed(2)}
-                      </div>
+                  <Image
+                    src={makeQrUrl(receiptUrl)}
+                    alt="Receipt QR"
+                    width={180}
+                    height={180}
+                    unoptimized
+                    style={{ borderRadius: 12, border: "1px solid #eee" }}
+                  />
+                  <div style={{ flex: 1, minWidth: 260 }}>
+                    <div style={{ fontSize: 12, opacity: 0.75 }}>
+                      Receipt link
                     </div>
+                    <a
+                      href={receiptUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      style={{ wordBreak: "break-all" }}
+                    >
+                      {receiptUrl}
+                    </a>
 
-                    <div style={{ fontFamily: "monospace", fontWeight: 900 }}>
-                      {currency} {Number(it.line_total ?? 0).toFixed(2)}
+                    <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
+                      Token
+                    </div>
+                    <div style={{ fontFamily: "monospace" }}>
+                      {snapshot.receipt?.token_id ?? "—"}
                     </div>
                   </div>
-                ))}
-              </div>
-            )}
+                </div>
+              )}
+            </div>
 
             <div style={{ marginTop: 14, fontSize: 12, opacity: 0.7 }}>
               Snapshot (debug)
