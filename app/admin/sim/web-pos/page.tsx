@@ -74,7 +74,16 @@ function nextLineNo(items: CartItem[]) {
   return max + 1;
 }
 
-export default function WebPosSimPageA2() {
+function newSaleId() {
+  // Works in modern browsers; fallback to timestamp if needed
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return `sale_${Date.now()}`;
+  }
+}
+
+export default function WebPosSimPageA3() {
   const supabase = useMemo(() => getSupabaseClient(), []);
 
   const [creating, setCreating] = useState(false);
@@ -90,6 +99,9 @@ export default function WebPosSimPageA2() {
   const snapshotRef = useRef<PosSimSnapshot | null>(null);
   const sessionIdRef = useRef<string | null>(null);
 
+  // For simulating async payment processing
+  const payTimerRef = useRef<number | null>(null);
+
   const customerFullUrl = useMemo(() => {
     if (!session) return "";
     if (typeof window === "undefined") return session.customer_url;
@@ -101,6 +113,11 @@ export default function WebPosSimPageA2() {
       const ch = channelRef.current;
       channelRef.current = null;
       if (ch) supabase.removeChannel(ch);
+
+      if (payTimerRef.current) {
+        window.clearTimeout(payTimerRef.current);
+        payTimerRef.current = null;
+      }
     };
   }, [supabase]);
 
@@ -122,10 +139,21 @@ export default function WebPosSimPageA2() {
       setHostStatus(`DB update failed: ${upErr.message}`);
     }
 
+    // A2/A3: broadcast cart update + snapshot sync
     const cartEv = makeEvent("CART_UPDATED", sid, snapshotPayload(nextSnap));
     const snapEv = makeEvent("SNAPSHOT_SYNC", sid, snapshotPayload(nextSnap));
     await safeSend(ch, cartEv);
     await safeSend(ch, snapEv);
+  }
+
+  function getSnap(): PosSimSnapshot | null {
+    return snapshotRef.current ?? session?.snapshot ?? null;
+  }
+
+  function cartIsEmpty(snap: PosSimSnapshot) {
+    return (
+      (snap.cart.items ?? []).length === 0 || Number(snap.cart.total ?? 0) <= 0
+    );
   }
 
   async function startSession() {
@@ -182,6 +210,7 @@ export default function WebPosSimPageA2() {
         const evUnknown = msg.payload;
         if (!isPosSimEvent(evUnknown)) return;
 
+        // Host is authoritative: if customer joins, re-send snapshot
         if (evUnknown.type === "CUSTOMER_JOINED") {
           const sid = sessionIdRef.current;
           const snap = snapshotRef.current;
@@ -228,7 +257,11 @@ export default function WebPosSimPageA2() {
 
   function addItem(ci: CatalogItem) {
     if (!session) return;
-    const snap = snapshotRef.current ?? session.snapshot;
+    const snap = getSnap();
+    if (!snap) return;
+
+    // block edits during processing/result for realism (optional)
+    if (snap.flow.stage === "PROCESSING") return;
 
     const items = [...(snap.cart.items ?? [])];
     const existing = items.find((i) => i.sku === ci.sku);
@@ -273,7 +306,11 @@ export default function WebPosSimPageA2() {
 
   function decItem(line_no: number) {
     if (!session) return;
-    const snap = snapshotRef.current ?? session.snapshot;
+    const snap = getSnap();
+    if (!snap) return;
+
+    if (snap.flow.stage === "PROCESSING") return;
+
     const items = [...(snap.cart.items ?? [])];
 
     const idx = items.findIndex((i) => i.line_no === line_no);
@@ -301,7 +338,11 @@ export default function WebPosSimPageA2() {
 
   function incItem(line_no: number) {
     if (!session) return;
-    const snap = snapshotRef.current ?? session.snapshot;
+    const snap = getSnap();
+    if (!snap) return;
+
+    if (snap.flow.stage === "PROCESSING") return;
+
     const items = [...(snap.cart.items ?? [])];
 
     const it = items.find((i) => i.line_no === line_no);
@@ -323,10 +364,14 @@ export default function WebPosSimPageA2() {
 
   function clearCart() {
     if (!session) return;
-    const snap = snapshotRef.current ?? session.snapshot;
+    const snap = getSnap();
+    if (!snap) return;
+
+    if (snap.flow.stage === "PROCESSING") return;
 
     const nextSnap: PosSimSnapshot = {
       ...snap,
+      flow: { ...snap.flow, stage: "CART", payment_state: "IDLE" },
       cart: {
         currency: snap.cart.currency ?? "EUR",
         items: [],
@@ -337,6 +382,165 @@ export default function WebPosSimPageA2() {
     };
 
     void persistAndBroadcast(nextSnap);
+  }
+
+  function updateToggle<K extends keyof PosSimSnapshot["toggles"]>(
+    key: K,
+    value: PosSimSnapshot["toggles"][K]
+  ) {
+    const snap = getSnap();
+    if (!snap) return;
+
+    const nextSnap: PosSimSnapshot = {
+      ...snap,
+      toggles: { ...snap.toggles, [key]: value },
+    };
+
+    void persistAndBroadcast(nextSnap);
+  }
+
+  function goToCheckout() {
+    const snap = getSnap();
+    if (!snap) return;
+
+    if (cartIsEmpty(snap)) {
+      setHostStatus("Add items before checkout");
+      return;
+    }
+
+    const nextSnap: PosSimSnapshot = {
+      ...snap,
+      flow: { ...snap.flow, stage: "CHECKOUT", payment_state: "INITIATED" },
+    };
+
+    setHostStatus("Checkout initiated");
+    void persistAndBroadcast(nextSnap);
+  }
+
+  function backToCart() {
+    const snap = getSnap();
+    if (!snap) return;
+
+    // If in PROCESSING, block back for realism
+    if (snap.flow.stage === "PROCESSING") return;
+
+    const nextSnap: PosSimSnapshot = {
+      ...snap,
+      flow: { ...snap.flow, stage: "CART", payment_state: "IDLE" },
+    };
+
+    setHostStatus("Back to cart");
+    void persistAndBroadcast(nextSnap);
+  }
+
+  function newSale() {
+    const snap = getSnap();
+    if (!snap) return;
+
+    if (payTimerRef.current) {
+      window.clearTimeout(payTimerRef.current);
+      payTimerRef.current = null;
+    }
+
+    const nextSnap: PosSimSnapshot = {
+      ...snap,
+      active_sale_id: newSaleId(),
+      flow: { stage: "CART", payment_state: "IDLE", issuance_state: "IDLE" },
+      receipt: null,
+      fallback: { printed: false, print_reason: null },
+      cart: {
+        currency: snap.cart.currency ?? "EUR",
+        items: [],
+        subtotal: 0,
+        vat_total: 0,
+        total: 0,
+      },
+    };
+
+    setHostStatus("New sale started");
+    void persistAndBroadcast(nextSnap);
+  }
+
+  function pay() {
+    const snap = getSnap();
+    if (!snap) return;
+
+    if (cartIsEmpty(snap)) {
+      setHostStatus("Cannot pay: cart is empty");
+      return;
+    }
+
+    if (snap.flow.stage !== "CHECKOUT" && snap.flow.stage !== "CART") {
+      // allow pay only from checkout for cleanliness
+      setHostStatus("Go to checkout first");
+      return;
+    }
+
+    // Cancel any pending timer
+    if (payTimerRef.current) {
+      window.clearTimeout(payTimerRef.current);
+      payTimerRef.current = null;
+    }
+
+    // Immediate NETWORK_ERROR if network is down
+    if (snap.toggles.network_mode === "down") {
+      const nextSnap: PosSimSnapshot = {
+        ...snap,
+        flow: { ...snap.flow, stage: "RESULT", payment_state: "NETWORK_ERROR" },
+      };
+      setHostStatus("Network down (simulated)");
+      void persistAndBroadcast(nextSnap);
+      return;
+    }
+
+    // Move to processing
+    const processingSnap: PosSimSnapshot = {
+      ...snap,
+      flow: { ...snap.flow, stage: "PROCESSING", payment_state: "PROCESSING" },
+    };
+    setHostStatus("Processing payment...");
+    void persistAndBroadcast(processingSnap);
+
+    const slow = snap.toggles.network_mode === "slow";
+
+    // Determine delay + final outcome
+    const baseDelay = slow ? 3500 : 1500;
+
+    // Timeout should feel longer
+    const delay =
+      snap.toggles.payment_outcome === "timeout"
+        ? slow
+          ? 9000
+          : 7000
+        : baseDelay;
+
+    payTimerRef.current = window.setTimeout(() => {
+      const latest = getSnap();
+      if (!latest) return;
+
+      // If user started a new sale mid-flight, ignore
+      if (latest.flow.stage !== "PROCESSING") return;
+
+      let finalState: PosSimSnapshot["flow"]["payment_state"] = "APPROVED";
+
+      if (latest.toggles.payment_outcome === "fail") finalState = "DECLINED";
+      if (latest.toggles.payment_outcome === "timeout") finalState = "TIMEOUT";
+
+      const resultSnap: PosSimSnapshot = {
+        ...latest,
+        flow: { ...latest.flow, stage: "RESULT", payment_state: finalState },
+      };
+
+      setHostStatus(
+        finalState === "APPROVED"
+          ? "Payment approved"
+          : finalState === "DECLINED"
+          ? "Payment declined"
+          : "Payment timed out"
+      );
+
+      void persistAndBroadcast(resultSnap);
+    }, delay);
   }
 
   if (!POS_SIM_ENABLED) {
@@ -350,13 +554,19 @@ export default function WebPosSimPageA2() {
     );
   }
 
+  const snap = session?.snapshot ?? null;
+
+  const stage = snap?.flow.stage ?? "BOOT";
+  const payState = snap?.flow.payment_state ?? "IDLE";
+
   return (
-    <div style={{ padding: 24, maxWidth: 980 }}>
-      <h1 style={{ fontSize: 22, fontWeight: 700 }}>
-        Receiptless POS Simulator — Web POS (A2)
+    <div style={{ padding: 24, maxWidth: 1040 }}>
+      <h1 style={{ fontSize: 22, fontWeight: 800 }}>
+        Receiptless POS Simulator — Web POS (A3)
       </h1>
       <p style={{ marginTop: 8 }}>
-        Milestone A2: cart building + CART_UPDATED + customer live totals.
+        Milestone A3: Checkout + payment outcomes (success/fail/timeout +
+        network modes).
       </p>
 
       <div style={{ marginTop: 10, fontSize: 13, opacity: 0.85 }}>
@@ -372,7 +582,7 @@ export default function WebPosSimPageA2() {
               padding: "12px 16px",
               borderRadius: 10,
               border: "1px solid #ccc",
-              fontWeight: 700,
+              fontWeight: 800,
             }}
           >
             {creating ? "Creating Session..." : "Start Demo Session"}
@@ -387,6 +597,7 @@ export default function WebPosSimPageA2() {
         <div
           style={{ marginTop: 18, display: "flex", gap: 16, flexWrap: "wrap" }}
         >
+          {/* Left column: session + toggles + catalog */}
           <div
             style={{
               flex: 1,
@@ -396,9 +607,29 @@ export default function WebPosSimPageA2() {
               padding: 14,
             }}
           >
-            <div style={{ fontSize: 12, opacity: 0.7 }}>Session Code</div>
-            <div style={{ fontSize: 26, fontWeight: 900, letterSpacing: 2 }}>
-              {session.session_code}
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: 12,
+              }}
+            >
+              <div>
+                <div style={{ fontSize: 12, opacity: 0.7 }}>Session Code</div>
+                <div
+                  style={{ fontSize: 26, fontWeight: 900, letterSpacing: 2 }}
+                >
+                  {session.session_code}
+                </div>
+              </div>
+              <div style={{ textAlign: "right" }}>
+                <div style={{ fontSize: 12, opacity: 0.7 }}>Stage</div>
+                <div style={{ fontWeight: 900 }}>{stage}</div>
+                <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
+                  Payment
+                </div>
+                <div style={{ fontWeight: 900 }}>{payState}</div>
+              </div>
             </div>
 
             <div style={{ marginTop: 10, fontSize: 12, opacity: 0.7 }}>
@@ -423,7 +654,63 @@ export default function WebPosSimPageA2() {
 
             <hr style={{ margin: "14px 0" }} />
 
-            <div style={{ fontSize: 14, fontWeight: 800, marginBottom: 8 }}>
+            {/* Toggles */}
+            <div style={{ fontSize: 14, fontWeight: 900, marginBottom: 8 }}>
+              Demo Toggles
+            </div>
+
+            <div style={{ display: "grid", gap: 10 }}>
+              <label style={{ display: "grid", gap: 6 }}>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>
+                  Payment Outcome
+                </div>
+                <select
+                  value={snap?.toggles.payment_outcome ?? "success"}
+                  onChange={(e) =>
+                    updateToggle(
+                      "payment_outcome",
+                      e.target.value as "success" | "fail" | "timeout"
+                    )
+                  }
+                  style={{
+                    padding: 10,
+                    borderRadius: 10,
+                    border: "1px solid #ccc",
+                  }}
+                >
+                  <option value="success">Success</option>
+                  <option value="fail">Fail</option>
+                  <option value="timeout">Timeout</option>
+                </select>
+              </label>
+
+              <label style={{ display: "grid", gap: 6 }}>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>Network Mode</div>
+                <select
+                  value={snap?.toggles.network_mode ?? "normal"}
+                  onChange={(e) =>
+                    updateToggle(
+                      "network_mode",
+                      e.target.value as "normal" | "slow" | "down"
+                    )
+                  }
+                  style={{
+                    padding: 10,
+                    borderRadius: 10,
+                    border: "1px solid #ccc",
+                  }}
+                >
+                  <option value="normal">Normal</option>
+                  <option value="slow">Slow</option>
+                  <option value="down">Down</option>
+                </select>
+              </label>
+            </div>
+
+            <hr style={{ margin: "14px 0" }} />
+
+            {/* Catalog */}
+            <div style={{ fontSize: 14, fontWeight: 900, marginBottom: 8 }}>
               Demo Catalog
             </div>
             <div style={{ display: "grid", gap: 8 }}>
@@ -431,12 +718,14 @@ export default function WebPosSimPageA2() {
                 <button
                   key={ci.sku}
                   onClick={() => addItem(ci)}
+                  disabled={stage === "PROCESSING"}
                   style={{
                     textAlign: "left",
                     padding: "10px 12px",
                     borderRadius: 10,
                     border: "1px solid #ccc",
                     background: "white",
+                    opacity: stage === "PROCESSING" ? 0.6 : 1,
                   }}
                 >
                   <div style={{ fontWeight: 800 }}>{ci.name}</div>
@@ -449,10 +738,11 @@ export default function WebPosSimPageA2() {
             </div>
           </div>
 
+          {/* Right column: cart + actions */}
           <div
             style={{
-              flex: 1.2,
-              minWidth: 420,
+              flex: 1.4,
+              minWidth: 520,
               border: "1px solid #ddd",
               borderRadius: 12,
               padding: 14,
@@ -467,20 +757,106 @@ export default function WebPosSimPageA2() {
               }}
             >
               <div style={{ fontSize: 14, fontWeight: 900 }}>Cart</div>
-              <button
-                onClick={clearCart}
+              <div
                 style={{
-                  border: "1px solid #ccc",
-                  borderRadius: 10,
-                  padding: "8px 10px",
-                  background: "white",
+                  display: "flex",
+                  gap: 8,
+                  flexWrap: "wrap",
+                  justifyContent: "flex-end",
                 }}
               >
-                Clear
+                <button
+                  onClick={newSale}
+                  style={{
+                    border: "1px solid #ccc",
+                    borderRadius: 10,
+                    padding: "8px 10px",
+                    background: "white",
+                    fontWeight: 800,
+                  }}
+                >
+                  New Sale
+                </button>
+                <button
+                  onClick={clearCart}
+                  disabled={stage === "PROCESSING"}
+                  style={{
+                    border: "1px solid #ccc",
+                    borderRadius: 10,
+                    padding: "8px 10px",
+                    background: "white",
+                    opacity: stage === "PROCESSING" ? 0.6 : 1,
+                  }}
+                >
+                  Clear
+                </button>
+              </div>
+            </div>
+
+            {/* Action bar */}
+            <div
+              style={{
+                marginTop: 12,
+                display: "flex",
+                gap: 10,
+                flexWrap: "wrap",
+              }}
+            >
+              <button
+                onClick={backToCart}
+                disabled={stage === "PROCESSING" || stage === "CART"}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #ccc",
+                  background: "white",
+                  fontWeight: 800,
+                  opacity: stage === "PROCESSING" || stage === "CART" ? 0.6 : 1,
+                }}
+              >
+                Back to Cart
+              </button>
+
+              <button
+                onClick={goToCheckout}
+                disabled={!snap || cartIsEmpty(snap) || stage === "PROCESSING"}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #ccc",
+                  background: "white",
+                  fontWeight: 900,
+                  opacity:
+                    !snap || cartIsEmpty(snap) || stage === "PROCESSING"
+                      ? 0.6
+                      : 1,
+                }}
+              >
+                Checkout
+              </button>
+
+              <button
+                onClick={pay}
+                disabled={!snap || cartIsEmpty(snap) || stage === "PROCESSING"}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #111",
+                  background: "#111",
+                  color: "white",
+                  fontWeight: 900,
+                  opacity:
+                    !snap || cartIsEmpty(snap) || stage === "PROCESSING"
+                      ? 0.6
+                      : 1,
+                }}
+              >
+                Pay
               </button>
             </div>
 
-            <div style={{ marginTop: 10 }}>
+            {/* Cart list */}
+            <div style={{ marginTop: 14 }}>
               {(session.snapshot.cart.items ?? []).length === 0 ? (
                 <div style={{ fontSize: 13, opacity: 0.8 }}>Cart is empty.</div>
               ) : (
@@ -515,12 +891,14 @@ export default function WebPosSimPageA2() {
                       >
                         <button
                           onClick={() => decItem(it.line_no)}
+                          disabled={stage === "PROCESSING"}
                           style={{
                             width: 34,
                             height: 34,
                             borderRadius: 10,
                             border: "1px solid #ccc",
                             background: "white",
+                            opacity: stage === "PROCESSING" ? 0.6 : 1,
                           }}
                         >
                           −
@@ -536,12 +914,14 @@ export default function WebPosSimPageA2() {
                         </div>
                         <button
                           onClick={() => incItem(it.line_no)}
+                          disabled={stage === "PROCESSING"}
                           style={{
                             width: 34,
                             height: 34,
                             borderRadius: 10,
                             border: "1px solid #ccc",
                             background: "white",
+                            opacity: stage === "PROCESSING" ? 0.6 : 1,
                           }}
                         >
                           +
@@ -557,6 +937,7 @@ export default function WebPosSimPageA2() {
               )}
             </div>
 
+            {/* Totals */}
             <div
               style={{
                 marginTop: 14,
@@ -597,6 +978,32 @@ export default function WebPosSimPageA2() {
               </div>
             </div>
 
+            {/* Result hint */}
+            {stage === "RESULT" && (
+              <div
+                style={{
+                  marginTop: 14,
+                  padding: 12,
+                  borderRadius: 12,
+                  border: "1px solid #eee",
+                  background: "white",
+                }}
+              >
+                <div style={{ fontWeight: 900 }}>Payment Result</div>
+                <div style={{ marginTop: 6, opacity: 0.85 }}>
+                  {payState === "APPROVED" &&
+                    "Approved — next milestone will issue the real receipt token."}
+                  {payState === "DECLINED" &&
+                    "Declined — adjust outcome toggle or try again."}
+                  {payState === "TIMEOUT" &&
+                    "Timeout — adjust outcome toggle or try again."}
+                  {payState === "NETWORK_ERROR" &&
+                    "Network error — set Network Mode back to Normal/Slow."}
+                </div>
+              </div>
+            )}
+
+            {/* Debug */}
             <div style={{ marginTop: 14, fontSize: 12, opacity: 0.7 }}>
               Snapshot (debug)
             </div>
