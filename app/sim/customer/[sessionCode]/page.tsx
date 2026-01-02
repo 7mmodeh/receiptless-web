@@ -58,8 +58,7 @@ function isSnapshotSync(
 }
 
 function makeQrUrl(data: string) {
-  // Google chart QR (fast + no deps)
-  return `https://www.google.com/chart?chs=300x300&cht=qr&chl=${encodeURIComponent(
+  return `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(
     data
   )}`;
 }
@@ -342,9 +341,10 @@ export default function CustomerDisplayPage() {
                   <Image
                     src={makeQrUrl(receiptUrl)}
                     alt="Receipt QR"
-                    width={180}
-                    height={180}
+                    width={300}
+                    height={300}
                     unoptimized
+                    referrerPolicy="no-referrer"
                     style={{ borderRadius: 12, border: "1px solid #eee" }}
                   />
                   <div style={{ flex: 1, minWidth: 260 }}>
