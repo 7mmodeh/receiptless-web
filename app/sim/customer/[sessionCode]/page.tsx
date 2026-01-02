@@ -28,9 +28,8 @@ function toStatus(v: unknown): string {
     const details = typeof r.details === "string" ? r.details : null;
     const hint = typeof r.hint === "string" ? r.hint : null;
 
-    if (message || details || hint) {
+    if (message || details || hint)
       return [message, details, hint].filter(Boolean).join(" | ");
-    }
 
     try {
       return JSON.stringify(v);
@@ -53,7 +52,7 @@ function isPosSimEvent(v: unknown): v is PosSimEvent {
   );
 }
 
-function isSnapshotSync(
+function isSnapshotPayload(
   ev: PosSimEvent
 ): ev is PosSimEvent & { payload: { snapshot: PosSimSnapshot } } {
   const p = ev.payload as Record<string, unknown>;
@@ -126,13 +125,17 @@ export default function CustomerDisplayPage() {
           const evUnknown = msg.payload;
           if (!isPosSimEvent(evUnknown)) return;
 
-          if (evUnknown.type === "SNAPSHOT_SYNC" && isSnapshotSync(evUnknown)) {
+          // A2: accept both SNAPSHOT_SYNC + CART_UPDATED payloads
+          if (
+            (evUnknown.type === "SNAPSHOT_SYNC" ||
+              evUnknown.type === "CART_UPDATED") &&
+            isSnapshotPayload(evUnknown)
+          ) {
             setSnapshot(evUnknown.payload.snapshot);
             setStatus("Live");
           }
         });
 
-        // IMPORTANT: do NOT await subscribe; handle status via callback
         ch.subscribe(async (st: SubscribeStatus) => {
           if (!mounted) return;
 
@@ -141,7 +144,7 @@ export default function CustomerDisplayPage() {
 
             const joinEv = makeEvent("CUSTOMER_JOINED", sid, {
               session_code: sessionCode,
-            } satisfies JsonObject);
+            } as unknown as JsonObject);
 
             await ch.send({
               type: "broadcast",
@@ -149,7 +152,7 @@ export default function CustomerDisplayPage() {
               payload: joinEv,
             });
 
-            // Optional safety: refresh snapshot once after join
+            // Refresh snapshot once after join (covers missed broadcasts)
             try {
               const refreshed = await fetchSnapshotByCode(sessionCode);
               if (mounted) {
@@ -200,6 +203,12 @@ export default function CustomerDisplayPage() {
       </div>
     );
   }
+
+  const currency = snapshot?.cart.currency ?? "EUR";
+  const items = snapshot?.cart.items ?? [];
+  const subtotal = Number(snapshot?.cart.subtotal ?? 0);
+  const vatTotal = Number(snapshot?.cart.vat_total ?? 0);
+  const total = Number(snapshot?.cart.total ?? 0);
 
   return (
     <div
@@ -297,14 +306,75 @@ export default function CustomerDisplayPage() {
               >
                 <div style={{ fontSize: 12, opacity: 0.7 }}>Total</div>
                 <div style={{ fontSize: 34, fontWeight: 900 }}>
-                  {snapshot.cart.currency}{" "}
-                  {Number(snapshot.cart.total ?? 0).toFixed(2)}
+                  {currency} {total.toFixed(2)}
                 </div>
-                <div style={{ marginTop: 8, fontSize: 13, opacity: 0.85 }}>
-                  Waiting for cart updates in Milestone A2.
+
+                <div
+                  style={{
+                    marginTop: 10,
+                    display: "flex",
+                    justifyContent: "space-between",
+                  }}
+                >
+                  <div style={{ opacity: 0.75 }}>Subtotal</div>
+                  <div style={{ fontWeight: 800 }}>
+                    {currency} {subtotal.toFixed(2)}
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    marginTop: 6,
+                    display: "flex",
+                    justifyContent: "space-between",
+                  }}
+                >
+                  <div style={{ opacity: 0.75 }}>VAT</div>
+                  <div style={{ fontWeight: 800 }}>
+                    {currency} {vatTotal.toFixed(2)}
+                  </div>
                 </div>
               </div>
             </div>
+
+            <div style={{ marginTop: 14, fontSize: 14, fontWeight: 900 }}>
+              Items
+            </div>
+
+            {items.length === 0 ? (
+              <div style={{ marginTop: 8, fontSize: 13, opacity: 0.85 }}>
+                Waiting for items…
+              </div>
+            ) : (
+              <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
+                {items.map((it) => (
+                  <div
+                    key={it.line_no}
+                    style={{
+                      border: "1px solid #eee",
+                      borderRadius: 12,
+                      padding: 12,
+                      display: "flex",
+                      justifyContent: "space-between",
+                      gap: 10,
+                      alignItems: "center",
+                    }}
+                  >
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontWeight: 900 }}>{it.name}</div>
+                      <div style={{ fontSize: 12, opacity: 0.75 }}>
+                        {it.sku ?? "—"} · {it.qty} × {currency}{" "}
+                        {Number(it.unit_price ?? 0).toFixed(2)}
+                      </div>
+                    </div>
+
+                    <div style={{ fontFamily: "monospace", fontWeight: 900 }}>
+                      {currency} {Number(it.line_total ?? 0).toFixed(2)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
 
             <div style={{ marginTop: 14, fontSize: 12, opacity: 0.7 }}>
               Snapshot (debug)

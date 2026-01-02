@@ -88,9 +88,25 @@ export type PosSimEventType =
   | "SESSION_CREATED"
   | "CUSTOMER_JOINED"
   | "SNAPSHOT_SYNC"
+  | "CART_UPDATED"
   | "RESET_REQUESTED";
 
-export type JsonObject = Record<string, unknown>;
+/**
+ * JSON payload type used for events.
+ * Non-recursive on purpose to avoid TS(2456) in some TS configs.
+ * Still prevents `any` and is sufficient for our simulator payloads.
+ */
+export type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | { [key: string]: JsonValueLeaf }
+  | JsonValueLeaf[];
+
+type JsonValueLeaf = string | number | boolean | null;
+
+export type JsonObject = Record<string, JsonValue>;
 
 export type PosSimEvent = {
   type: PosSimEventType;

@@ -21,5 +21,6 @@ export function makeEvent(
 }
 
 export function snapshotPayload(snapshot: PosSimSnapshot): JsonObject {
-  return { snapshot };
+  // snapshot is not JsonValue-typed; cast is intentional + contained
+  return { snapshot } as unknown as JsonObject;
 }
