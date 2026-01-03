@@ -76,7 +76,10 @@ export default function CustomerDisplayPage() {
   const [status, setStatus] = useState<string>("Connecting...");
 
   const channelRef = useRef<RealtimeChannel | null>(null);
-  const autoScanRef = useRef(false);
+
+  // Prevent repeated auto-scan for the same receipt token
+  const lastAutoScanTokenRef = useRef<string | null>(null);
+  const autoScanTimerRef = useRef<number | null>(null);
 
   const title = useMemo(() => {
     const tc = snapshot?.terminal?.terminal_code;
@@ -187,57 +190,71 @@ export default function CustomerDisplayPage() {
 
     return () => {
       mounted = false;
+
+      if (autoScanTimerRef.current) {
+        window.clearTimeout(autoScanTimerRef.current);
+        autoScanTimerRef.current = null;
+      }
+
       const ch = channelRef.current;
       channelRef.current = null;
       if (ch) supabase.removeChannel(ch);
     };
   }, [sessionCode, supabase]);
 
-  async function broadcastScan(outcome: "success" | "fail") {
-    const sid = sessionId;
-    const ch = channelRef.current;
-    if (!sid || !ch) return;
-
-    const message =
-      outcome === "success"
-        ? "Receipt linked to wallet (simulated)."
-        : "Scan failed (simulated).";
-
-    const ev = makeEvent("CUSTOMER_SCANNED", sid, {
-      outcome,
-      message,
-      session_code: sessionCode,
-    } satisfies JsonObject);
-
-    await ch.send({ type: "broadcast", event: "pos_sim", payload: ev });
-  }
-
-  // Auto scan simulation
+  // Customer scan simulation:
+  // When receipt token is ready and toggle requests auto scan, broadcast CUSTOMER_SCANNED once per token.
   useEffect(() => {
+    const ch = channelRef.current;
+    if (!ch) return;
     if (!snapshot) return;
-    const receiptUrl = snapshot.receipt?.public_url ?? null;
-    if (!receiptUrl) return;
+    if (!sessionId) return;
 
-    const mode = snapshot.toggles.customer_scan_sim ?? "none";
-    if (mode === "none") return;
-
-    if (autoScanRef.current) return;
-
+    const tokenId = snapshot.receipt?.token_id ?? null;
+    const sim = snapshot.toggles?.customer_scan_sim ?? "none";
     const scanState = snapshot.scan?.state ?? "NONE";
+
+    if (!tokenId) return;
+    if (sim === "none") return;
+
+    // If host already recorded a terminal scan result, do not re-send
     if (scanState === "SUCCESS" || scanState === "FAIL") return;
 
-    autoScanRef.current = true;
+    // Prevent repeating for same token
+    if (lastAutoScanTokenRef.current === tokenId) return;
+    lastAutoScanTokenRef.current = tokenId;
 
-    const outcome = mode === "auto_success" ? "success" : "fail";
-    const delay = 1200;
+    if (autoScanTimerRef.current) {
+      window.clearTimeout(autoScanTimerRef.current);
+      autoScanTimerRef.current = null;
+    }
 
-    const t = window.setTimeout(() => {
-      void broadcastScan(outcome);
-    }, delay);
+    autoScanTimerRef.current = window.setTimeout(async () => {
+      const outcome = sim === "auto_success" ? "success" : "fail";
+      const message =
+        outcome === "success"
+          ? "Receipt linked to wallet (simulated)."
+          : "Scan failed (simulated).";
 
-    return () => window.clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [snapshot?.receipt?.public_url, snapshot?.toggles?.customer_scan_sim]);
+      const ev = makeEvent("CUSTOMER_SCANNED", sessionId, {
+        outcome,
+        message,
+        token_id: tokenId,
+      } satisfies JsonObject);
+
+      await ch.send({
+        type: "broadcast",
+        event: "pos_sim",
+        payload: ev,
+      });
+    }, 1200);
+  }, [
+    snapshot?.receipt?.token_id,
+    snapshot?.toggles?.customer_scan_sim,
+    snapshot?.scan?.state,
+    sessionId,
+    snapshot,
+  ]);
 
   if (!POS_SIM_ENABLED) {
     return (
@@ -251,19 +268,6 @@ export default function CustomerDisplayPage() {
   }
 
   const receiptUrl = snapshot?.receipt?.public_url ?? null;
-  const scanState = snapshot?.scan?.state ?? "NONE";
-
-  const canScan =
-    !!receiptUrl &&
-    !(scanState === "SUCCESS" || scanState === "FAIL") &&
-    status === "Live";
-
-  function scanOutcomeFromToggle(): "success" | "fail" {
-    const mode = snapshot?.toggles.customer_scan_sim ?? "none";
-    if (mode === "auto_fail") return "fail";
-    if (mode === "auto_success") return "success";
-    return "success"; // manual default
-  }
 
   return (
     <div
@@ -352,7 +356,9 @@ export default function CustomerDisplayPage() {
                 <div style={{ marginTop: 10, fontSize: 12, opacity: 0.7 }}>
                   Scan
                 </div>
-                <div style={{ fontSize: 16, fontWeight: 700 }}>{scanState}</div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>
+                  {snapshot.scan?.state ?? "—"}
+                </div>
               </div>
 
               <div
@@ -374,48 +380,10 @@ export default function CustomerDisplayPage() {
                     ? "Scan the QR to receive your receipt."
                     : "Waiting for receipt issuance."}
                 </div>
-
-                <div
-                  style={{
-                    marginTop: 12,
-                    display: "flex",
-                    gap: 10,
-                    flexWrap: "wrap",
-                  }}
-                >
-                  <button
-                    disabled={!canScan}
-                    onClick={() => {
-                      const outcome = scanOutcomeFromToggle();
-                      void broadcastScan(outcome);
-                    }}
-                    style={{
-                      padding: "10px 12px",
-                      borderRadius: 10,
-                      border: "1px solid #111",
-                      background: canScan ? "#111" : "#fff",
-                      color: canScan ? "#fff" : "#111",
-                      fontWeight: 900,
-                      opacity: canScan ? 1 : 0.5,
-                    }}
-                  >
-                    Simulate Scan
-                  </button>
-
-                  <div
-                    style={{
-                      fontSize: 12,
-                      opacity: 0.7,
-                      alignSelf: "center",
-                    }}
-                  >
-                    Toggle drives outcome:{" "}
-                    <b>{snapshot.toggles.customer_scan_sim ?? "none"}</b>
-                  </div>
-                </div>
               </div>
             </div>
 
+            {/* Receipt panel */}
             <div
               style={{
                 marginTop: 16,
@@ -471,22 +439,15 @@ export default function CustomerDisplayPage() {
                       {snapshot.receipt?.token_id ?? "—"}
                     </div>
 
-                    {snapshot.scan?.message && (
-                      <>
-                        <div
-                          style={{
-                            marginTop: 10,
-                            fontSize: 12,
-                            opacity: 0.75,
-                          }}
-                        >
-                          Scan message
-                        </div>
-                        <div style={{ opacity: 0.9 }}>
-                          {snapshot.scan.message}
-                        </div>
-                      </>
-                    )}
+                    <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
+                      Scan status
+                    </div>
+                    <div style={{ fontWeight: 700 }}>
+                      {snapshot.scan?.state ?? "—"}
+                      {snapshot.scan?.message
+                        ? ` — ${snapshot.scan.message}`
+                        : ""}
+                    </div>
                   </div>
                 </div>
               )}

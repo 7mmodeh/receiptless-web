@@ -126,6 +126,22 @@ function stripUndefined(obj: unknown): unknown {
   return obj;
 }
 
+function normalizeDbEventRow(v: unknown): PosSimDbEvent | null {
+  if (!v || typeof v !== "object") return null;
+  const r = v as Record<string, unknown>;
+  if (
+    typeof r.id !== "string" ||
+    typeof r.session_id !== "string" ||
+    typeof r.event_type !== "string" ||
+    typeof r.created_at !== "string" ||
+    typeof r.payload !== "object" ||
+    r.payload === null
+  ) {
+    return null;
+  }
+  return r as unknown as PosSimDbEvent;
+}
+
 export default function WebPosSimPageA4() {
   const supabase = useMemo(() => getSupabaseClient(), []);
 
@@ -177,6 +193,9 @@ export default function WebPosSimPageA4() {
     };
   }, [supabase]);
 
+  // ==========================
+  // Durable timeline (Option B)
+  // ==========================
   async function logDbEvent(event_type: string, payload: JsonObject) {
     const sid = sessionIdRef.current;
     if (!sid) return;
@@ -185,47 +204,50 @@ export default function WebPosSimPageA4() {
 
     const safePayload = stripUndefined(payload) as JsonObject;
 
-    const { data, error } = await supabase
-      .from("pos_sim_events")
-      .insert([{ session_id: sid, event_type, payload: safePayload }])
-      .select("id, session_id, event_type, payload, created_at")
-      .single();
+    const { data, error } = await supabase.rpc("pos_sim_log_event", {
+      p_session_id: sid,
+      p_event_type: event_type,
+      p_payload: safePayload as unknown as Record<string, unknown>,
+    });
 
     if (error) {
       setTimelineWriteStatus(`FAILED: ${error.message}`);
-      console.error("pos_sim_events insert failed:", error);
-      // This is why you were seeing 0 events — now it will be visible.
+      console.error("pos_sim_log_event RPC failed:", error);
+      return;
+    }
+
+    const row = normalizeDbEventRow(data);
+    if (!row) {
+      setTimelineWriteStatus("FAILED: invalid RPC return shape");
+      console.error("pos_sim_log_event returned unexpected data:", data);
       return;
     }
 
     setTimelineWriteStatus("ok");
-
-    const inserted = data as unknown as PosSimDbEvent | null;
-    if (!inserted) return;
-
     setTimeline((prev) => {
-      if (prev.some((e) => e.id === inserted.id)) return prev;
-      return [...prev, inserted];
+      if (prev.some((e) => e.id === row.id)) return prev;
+      return [...prev, row];
     });
   }
 
   async function loadTimelineAndSubscribe(sessionId: string) {
-    // Load history
-    const { data, error } = await supabase
-      .from("pos_sim_events")
-      .select("id, session_id, event_type, payload, created_at")
-      .eq("session_id", sessionId)
-      .order("created_at", { ascending: true })
-      .limit(400);
+    // Load history via RPC
+    const { data, error } = await supabase.rpc("pos_sim_get_events", {
+      p_session_id: sessionId,
+      p_limit: 400,
+    });
 
     if (error) {
       setTimelineWriteStatus(`read FAILED: ${error.message}`);
     } else if (Array.isArray(data)) {
-      setTimeline(data as unknown as PosSimDbEvent[]);
+      const rows = data
+        .map(normalizeDbEventRow)
+        .filter(Boolean) as PosSimDbEvent[];
+      setTimeline(rows);
       setTimelineWriteStatus("read ok");
     }
 
-    // Subscribe to inserts (requires Supabase Realtime enabled for table)
+    // Subscribe to INSERTs (optional; requires publication + realtime enabled)
     if (timelineChRef.current) {
       supabase.removeChannel(timelineChRef.current);
       timelineChRef.current = null;
@@ -243,7 +265,8 @@ export default function WebPosSimPageA4() {
         filter: `session_id=eq.${sessionId}`,
       },
       (payload) => {
-        const row = payload.new as unknown as PosSimDbEvent;
+        const row = normalizeDbEventRow(payload.new);
+        if (!row) return;
         setTimeline((prev) => {
           if (prev.some((e) => e.id === row.id)) return prev;
           return [...prev, row];
@@ -252,14 +275,15 @@ export default function WebPosSimPageA4() {
     );
 
     tch.subscribe((st) => {
-      // If this table is not enabled for realtime, you will not get inserts here.
-      // History will still show if inserts work.
       if (st === "CHANNEL_ERROR") {
         setTimelineWriteStatus((s) => `${s} | realtime CHANNEL_ERROR`);
       }
     });
   }
 
+  // ==========================
+  // Canonical snapshot: pos_sim_sessions.snapshot_json
+  // ==========================
   async function persistSnapshot(nextSnap: PosSimSnapshot) {
     const sid = sessionIdRef.current;
     const ch = channelRef.current;
@@ -288,12 +312,14 @@ export default function WebPosSimPageA4() {
     event_payload?: JsonObject
   ) {
     await persistSnapshot(nextSnap);
-
     if (event_type) {
       await logDbEvent(event_type, event_payload ?? ({} as JsonObject));
     }
   }
 
+  // ==========================
+  // Paper receipt fallback
+  // ==========================
   function canAutoFallbackPrint(snap: PosSimSnapshot) {
     return (
       snap.toggles.print_fallback === "enabled" &&
@@ -308,9 +334,11 @@ export default function WebPosSimPageA4() {
     const snap = getSnap();
     if (!snap) return;
 
+    // Rule #1: button/manual print after payment approved
+    // Rule #2: auto fallback on scan fail / issuance fail after approved
     if (!canAutoFallbackPrint(snap)) {
       setHostStatus(
-        "Fallback print not allowed (toggle disabled / not approved / already printed)"
+        "Print not allowed (toggle disabled / not approved / already printed)"
       );
       return;
     }
@@ -324,9 +352,13 @@ export default function WebPosSimPageA4() {
     setHostStatus(`Printed paper receipt (${reason})`);
     await persistAndBroadcast(nextSnap, "FALLBACK_PRINTED", {
       reason,
+      sale_id: nextSnap.active_sale_id ?? null,
     } as unknown as JsonObject);
   }
 
+  // ==========================
+  // Session start
+  // ==========================
   async function startSession() {
     if (!POS_SIM_ENABLED) return;
 
@@ -409,9 +441,7 @@ export default function WebPosSimPageA4() {
             if (!sid || !snap) return;
 
             const p = evUnknown.payload as Record<string, unknown>;
-            const outcome = (p.outcome === "success" ? "SUCCESS" : "FAIL") as
-              | "SUCCESS"
-              | "FAIL";
+            const outcome = p.outcome === "success" ? "SUCCESS" : "FAIL";
             const message =
               typeof p.message === "string"
                 ? p.message
@@ -422,7 +452,7 @@ export default function WebPosSimPageA4() {
             const nextSnap: PosSimSnapshot = {
               ...snap,
               scan: {
-                state: outcome,
+                state: outcome === "SUCCESS" ? "SUCCESS" : "FAIL",
                 scanned_at: new Date().toISOString(),
                 message,
               },
@@ -437,6 +467,7 @@ export default function WebPosSimPageA4() {
             await persistAndBroadcast(nextSnap, "CUSTOMER_SCANNED", {
               outcome: outcome === "SUCCESS" ? "success" : "fail",
               message,
+              token_id: snap.receipt?.token_id ?? null,
             } as unknown as JsonObject);
 
             // Rule #2: payment success + scan fail => fallback print
@@ -487,6 +518,9 @@ export default function WebPosSimPageA4() {
     }
   }
 
+  // ==========================
+  // Cart ops
+  // ==========================
   function addItem(ci: CatalogItem) {
     if (!session) return;
     const snap = getSnap();
@@ -633,7 +667,7 @@ export default function WebPosSimPageA4() {
       toggles: { ...snap.toggles, [key]: value },
     };
 
-    void persistAndBroadcast(nextSnap, "SNAPSHOT_SYNC", {
+    void persistAndBroadcast(nextSnap, "TOGGLE_UPDATED", {
       toggle: String(key),
       value: String(value),
     } as unknown as JsonObject);
@@ -673,7 +707,7 @@ export default function WebPosSimPageA4() {
     };
 
     setHostStatus("Back to cart");
-    void persistAndBroadcast(nextSnap, "SNAPSHOT_SYNC", {
+    void persistAndBroadcast(nextSnap, "STAGE_CHANGED", {
       stage: "CART",
     } as unknown as JsonObject);
   }
@@ -711,6 +745,9 @@ export default function WebPosSimPageA4() {
     } as unknown as JsonObject);
   }
 
+  // ==========================
+  // Payment
+  // ==========================
   function pay() {
     const snap = getSnap();
     if (!snap) return;
@@ -742,8 +779,7 @@ export default function WebPosSimPageA4() {
         state: "NETWORK_ERROR",
       } as unknown as JsonObject);
 
-      // Rule #2: network fail -> fallback print (if payment was already approved; in this branch it isn't)
-      // Here, payment never approved; so we do NOT print.
+      // NOTE: payment not approved => no fallback print
       return;
     }
 
@@ -800,11 +836,12 @@ export default function WebPosSimPageA4() {
       void persistAndBroadcast(resultSnap, "PAYMENT_RESULT", {
         state: finalState,
       } as unknown as JsonObject);
-
-      // If you ever decide "timeout but money taken" => approved, that logic would go here.
     }, delay);
   }
 
+  // ==========================
+  // Receipt issuance
+  // ==========================
   async function issueReceipt() {
     const snap = getSnap();
     if (!snap) return;
@@ -978,7 +1015,8 @@ export default function WebPosSimPageA4() {
       </h1>
       <p style={{ marginTop: 8 }}>
         Canonical: <b>pos_sim_sessions.snapshot_json</b>. Durable timeline:{" "}
-        <b>pos_sim_events</b>. Broadcast stays for instant sync.
+        <b>pos_sim_events</b> (via SECURITY DEFINER RPC). Broadcast stays for
+        instant sync.
       </p>
 
       <div style={{ marginTop: 10, fontSize: 13, opacity: 0.85 }}>
@@ -1589,7 +1627,7 @@ export default function WebPosSimPageA4() {
             <div style={{ marginTop: 10, maxHeight: 760, overflow: "auto" }}>
               {timeline.length === 0 ? (
                 <div style={{ fontSize: 13, opacity: 0.8 }}>
-                  No events yet. If Timeline status shows FAILED, the insert is
+                  No events yet. If Timeline status shows FAILED, the RPC is
                   failing — copy that error.
                 </div>
               ) : (

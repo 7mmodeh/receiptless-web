@@ -51,13 +51,7 @@ export type ReceiptInfo = {
   preview_url?: string | null;
 };
 
-export type ReceiptScanState = "NONE" | "PENDING" | "SUCCESS" | "FAIL";
-
-export type ReceiptScanInfo = {
-  state: ReceiptScanState;
-  scanned_at?: string | null;
-  message?: string | null;
-};
+export type ScanState = "NONE" | "PENDING" | "SUCCESS" | "FAIL";
 
 export type PosSimSnapshot = {
   session_id: string | null;
@@ -86,8 +80,11 @@ export type PosSimSnapshot = {
 
   receipt: ReceiptInfo | null;
 
-  // Customer scan simulation state (stored inside snapshot_json)
-  scan?: ReceiptScanInfo | null;
+  scan?: {
+    state: ScanState;
+    scanned_at?: string | null;
+    message?: string | null;
+  };
 
   fallback: {
     printed: boolean;
@@ -98,24 +95,11 @@ export type PosSimSnapshot = {
 export type PosSimEventType =
   | "SESSION_CREATED"
   | "CUSTOMER_JOINED"
-  | "CART_UPDATED"
-  | "CHECKOUT_INITIATED"
-  | "PAYMENT_PROCESSING"
-  | "PAYMENT_RESULT"
-  | "RECEIPT_ISSUANCE_STARTED"
-  | "RECEIPT_TOKEN_READY"
-  | "RECEIPT_ISSUANCE_FAILED"
   | "CUSTOMER_SCANNED"
-  | "FALLBACK_PRINTED"
-  | "NEW_SALE_STARTED"
-  | "CART_CLEARED"
+  | "CART_UPDATED"
   | "SNAPSHOT_SYNC"
   | "RESET_REQUESTED";
 
-/**
- * JSON payload type used for events.
- * Non-recursive on purpose to avoid TS(2456) in some TS configs.
- */
 export type JsonValue =
   | string
   | number
@@ -136,11 +120,13 @@ export type PosSimEvent = {
   payload: JsonObject;
 };
 
+// Broadcast wrapper Supabase gives to the callback
 export type BroadcastMessage = {
   event: string;
   payload: unknown;
 };
 
+// --- DB event row for durable timeline ---
 export type PosSimDbEvent = {
   id: string;
   session_id: string;
