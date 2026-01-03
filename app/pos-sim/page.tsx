@@ -1,3 +1,5 @@
+"use client";
+
 // app/pos-sim/page.tsx
 
 import { PosPaymentOutcomeSimulator } from "@/components/PosPaymentOutcomeSimulator";
