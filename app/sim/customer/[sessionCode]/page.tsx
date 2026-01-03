@@ -1,3 +1,4 @@
+// app/sim/customer/[sessionCode]/page.tsx
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -75,6 +76,7 @@ export default function CustomerDisplayPage() {
   const [status, setStatus] = useState<string>("Connecting...");
 
   const channelRef = useRef<RealtimeChannel | null>(null);
+  const autoScanRef = useRef(false);
 
   const title = useMemo(() => {
     const tc = snapshot?.terminal?.terminal_code;
@@ -191,6 +193,54 @@ export default function CustomerDisplayPage() {
     };
   }, [sessionCode, supabase]);
 
+  async function broadcastScan(outcome: "success" | "fail") {
+    const sid = sessionId;
+    const ch = channelRef.current;
+    if (!sid || !ch) return;
+
+    const message =
+      outcome === "success"
+        ? "Receipt linked to wallet (simulated)."
+        : "Scan failed (simulated).";
+
+    const ev = makeEvent("CUSTOMER_SCANNED", sid, {
+      outcome,
+      message,
+      session_code: sessionCode,
+    } satisfies JsonObject);
+
+    await ch.send({ type: "broadcast", event: "pos_sim", payload: ev });
+  }
+
+  // Auto scan simulation (optional)
+  useEffect(() => {
+    if (!snapshot) return;
+    const receiptUrl = snapshot.receipt?.public_url ?? null;
+    if (!receiptUrl) return;
+
+    const mode = snapshot.toggles.customer_scan_sim ?? "none";
+    if (mode === "none") return;
+
+    // only once per page load
+    if (autoScanRef.current) return;
+
+    // only if scan is not already final
+    const scanState = snapshot.scan?.state ?? "NONE";
+    if (scanState === "SUCCESS" || scanState === "FAIL") return;
+
+    autoScanRef.current = true;
+
+    const outcome = mode === "auto_success" ? "success" : "fail";
+    const delay = 1200;
+
+    const t = window.setTimeout(() => {
+      void broadcastScan(outcome);
+    }, delay);
+
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [snapshot?.receipt?.public_url, snapshot?.toggles?.customer_scan_sim]);
+
   if (!POS_SIM_ENABLED) {
     return (
       <div style={{ padding: 24 }}>
@@ -203,6 +253,12 @@ export default function CustomerDisplayPage() {
   }
 
   const receiptUrl = snapshot?.receipt?.public_url ?? null;
+  const scanState = snapshot?.scan?.state ?? "NONE";
+
+  const canScan =
+    !!receiptUrl &&
+    !(scanState === "SUCCESS" || scanState === "FAIL") &&
+    status === "Live";
 
   return (
     <div
@@ -287,6 +343,11 @@ export default function CustomerDisplayPage() {
                 <div style={{ fontSize: 16, fontWeight: 700 }}>
                   {snapshot.flow.issuance_state}
                 </div>
+
+                <div style={{ marginTop: 10, fontSize: 12, opacity: 0.7 }}>
+                  Scan
+                </div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>{scanState}</div>
               </div>
 
               <div
@@ -308,10 +369,45 @@ export default function CustomerDisplayPage() {
                     ? "Scan the QR to receive your receipt."
                     : "Waiting for receipt issuance."}
                 </div>
+
+                <div
+                  style={{
+                    marginTop: 12,
+                    display: "flex",
+                    gap: 10,
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <button
+                    disabled={!canScan}
+                    onClick={() => {
+                      const mode = snapshot.toggles.customer_scan_sim ?? "none";
+                      const outcome = mode === "auto_fail" ? "fail" : "success";
+                      void broadcastScan(outcome);
+                    }}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid #111",
+                      background: canScan ? "#111" : "#fff",
+                      color: canScan ? "#fff" : "#111",
+                      fontWeight: 900,
+                      opacity: canScan ? 1 : 0.5,
+                    }}
+                  >
+                    Simulate Scan
+                  </button>
+
+                  <div
+                    style={{ fontSize: 12, opacity: 0.7, alignSelf: "center" }}
+                  >
+                    Toggle drives outcome:{" "}
+                    <b>{snapshot.toggles.customer_scan_sim ?? "none"}</b>
+                  </div>
+                </div>
               </div>
             </div>
 
-            {/* Receipt panel */}
             <div
               style={{
                 marginTop: 16,
@@ -366,6 +462,19 @@ export default function CustomerDisplayPage() {
                     <div style={{ fontFamily: "monospace" }}>
                       {snapshot.receipt?.token_id ?? "—"}
                     </div>
+
+                    {snapshot.scan?.message && (
+                      <>
+                        <div
+                          style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}
+                        >
+                          Scan message
+                        </div>
+                        <div style={{ opacity: 0.9 }}>
+                          {snapshot.scan.message}
+                        </div>
+                      </>
+                    )}
                   </div>
                 </div>
               )}

@@ -1,3 +1,4 @@
+// app/admin/sim/web-pos/page.tsx
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -13,6 +14,7 @@ import type {
   PosSimEvent,
   PosSimSnapshot,
   CartItem,
+  PosSimDbEvent,
 } from "@/lib/posSimTypes";
 import { channelName, makeEvent, snapshotPayload } from "@/lib/posSimRealtime";
 
@@ -88,6 +90,28 @@ function cartIsEmpty(snap: PosSimSnapshot) {
   );
 }
 
+function fmtTime(iso: string) {
+  try {
+    const d = new Date(iso);
+    return d.toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  } catch {
+    return iso;
+  }
+}
+
+function shortJson(v: unknown) {
+  try {
+    const s = JSON.stringify(v);
+    return s.length > 160 ? s.slice(0, 160) + "…" : s;
+  } catch {
+    return String(v);
+  }
+}
+
 export default function WebPosSimPageA4() {
   const supabase = useMemo(() => getSupabaseClient(), []);
 
@@ -99,6 +123,10 @@ export default function WebPosSimPageA4() {
     customer_url: string;
     snapshot: PosSimSnapshot;
   } | null>(null);
+
+  // Durable timeline
+  const [timeline, setTimeline] = useState<PosSimDbEvent[]>([]);
+  const timelineChRef = useRef<RealtimeChannel | null>(null);
 
   const channelRef = useRef<RealtimeChannel | null>(null);
   const snapshotRef = useRef<PosSimSnapshot | null>(null);
@@ -123,6 +151,10 @@ export default function WebPosSimPageA4() {
       channelRef.current = null;
       if (ch) supabase.removeChannel(ch);
 
+      const tch = timelineChRef.current;
+      timelineChRef.current = null;
+      if (tch) supabase.removeChannel(tch);
+
       if (payTimerRef.current) {
         window.clearTimeout(payTimerRef.current);
         payTimerRef.current = null;
@@ -130,7 +162,71 @@ export default function WebPosSimPageA4() {
     };
   }, [supabase]);
 
-  async function persistAndBroadcast(nextSnap: PosSimSnapshot) {
+  async function logDbEvent(event_type: string, payload: JsonObject) {
+    const sid = sessionIdRef.current;
+    if (!sid) return;
+
+    const { data, error } = await supabase
+      .from("pos_sim_events")
+      .insert([{ session_id: sid, event_type, payload }])
+      .select("id, session_id, event_type, payload, created_at")
+      .maybeSingle();
+
+    if (error) {
+      // non-fatal; timeline still works via broadcast
+      console.warn("pos_sim_events insert failed:", error.message);
+      return;
+    }
+
+    if (data) {
+      setTimeline((prev) => [...prev, data as unknown as PosSimDbEvent]);
+    }
+  }
+
+  async function loadTimelineAndSubscribe(sessionId: string) {
+    // Load history
+    const { data, error } = await supabase
+      .from("pos_sim_events")
+      .select("id, session_id, event_type, payload, created_at")
+      .eq("session_id", sessionId)
+      .order("created_at", { ascending: true })
+      .limit(400);
+
+    if (!error && Array.isArray(data)) {
+      setTimeline(data as unknown as PosSimDbEvent[]);
+    }
+
+    // Subscribe to inserts (durable realtime)
+    if (timelineChRef.current) {
+      supabase.removeChannel(timelineChRef.current);
+      timelineChRef.current = null;
+    }
+
+    const tch = supabase.channel(`pos-sim-events:${sessionId}`);
+    timelineChRef.current = tch;
+
+    tch.on(
+      "postgres_changes",
+      {
+        event: "INSERT",
+        schema: "public",
+        table: "pos_sim_events",
+        filter: `session_id=eq.${sessionId}`,
+      },
+      (payload) => {
+        const row = payload.new as unknown as PosSimDbEvent;
+        setTimeline((prev) => {
+          // de-dupe by id
+          if (prev.some((e) => e.id === row.id)) return prev;
+          return [...prev, row];
+        });
+      }
+    );
+
+    tch.subscribe();
+  }
+
+  async function persistSnapshot(nextSnap: PosSimSnapshot) {
     const sid = sessionIdRef.current;
     const ch = channelRef.current;
     if (!sid || !ch) return;
@@ -138,6 +234,7 @@ export default function WebPosSimPageA4() {
     snapshotRef.current = nextSnap;
     setSession((prev) => (prev ? { ...prev, snapshot: nextSnap } : prev));
 
+    // Canonical snapshot
     const { error: upErr } = await supabase
       .from("pos_sim_sessions")
       .update({ snapshot_json: nextSnap })
@@ -148,10 +245,36 @@ export default function WebPosSimPageA4() {
       setHostStatus(`DB update failed: ${upErr.message}`);
     }
 
-    const cartEv = makeEvent("CART_UPDATED", sid, snapshotPayload(nextSnap));
+    // Broadcast for instant sync (customer display)
     const snapEv = makeEvent("SNAPSHOT_SYNC", sid, snapshotPayload(nextSnap));
-    await safeSend(ch, cartEv);
     await safeSend(ch, snapEv);
+  }
+
+  async function persistAndBroadcast(
+    nextSnap: PosSimSnapshot,
+    event_type?: string,
+    event_payload?: JsonObject
+  ) {
+    await persistSnapshot(nextSnap);
+
+    // Durable timeline event (optional)
+    if (event_type) {
+      await logDbEvent(event_type, event_payload ?? ({} as JsonObject));
+    }
+
+    // Broadcast a light event for listeners (optional)
+    const sid = sessionIdRef.current;
+    const ch = channelRef.current;
+    if (!sid || !ch) return;
+
+    if (event_type) {
+      const ev = makeEvent(
+        "CART_UPDATED", // keep compatibility with existing listeners
+        sid,
+        { event_type, ...(event_payload ?? {}) } as unknown as JsonObject
+      );
+      await safeSend(ch, ev);
+    }
   }
 
   async function startSession() {
@@ -192,6 +315,9 @@ export default function WebPosSimPageA4() {
       snapshotRef.current = snapshot;
       sessionIdRef.current = session_id;
 
+      // Load and subscribe timeline
+      await loadTimelineAndSubscribe(session_id);
+
       if (channelRef.current) {
         supabase.removeChannel(channelRef.current);
         channelRef.current = null;
@@ -204,23 +330,80 @@ export default function WebPosSimPageA4() {
       });
       channelRef.current = ch;
 
-      ch.on("broadcast", { event: "pos_sim" }, (msg: BroadcastMessage) => {
-        const evUnknown = msg.payload;
-        if (!isPosSimEvent(evUnknown)) return;
+      ch.on(
+        "broadcast",
+        { event: "pos_sim" },
+        async (msg: BroadcastMessage) => {
+          const evUnknown = msg.payload;
+          if (!isPosSimEvent(evUnknown)) return;
 
-        if (evUnknown.type === "CUSTOMER_JOINED") {
-          const sid = sessionIdRef.current;
-          const snap = snapshotRef.current;
-          if (!sid || !snap) return;
+          if (evUnknown.type === "CUSTOMER_JOINED") {
+            const sid = sessionIdRef.current;
+            const snap = snapshotRef.current;
+            if (!sid || !snap) return;
 
-          const snapEv = makeEvent("SNAPSHOT_SYNC", sid, snapshotPayload(snap));
-          void safeSend(ch, snapEv);
+            await logDbEvent("CUSTOMER_JOINED", {
+              session_code,
+            } as unknown as JsonObject);
+
+            const snapEv = makeEvent(
+              "SNAPSHOT_SYNC",
+              sid,
+              snapshotPayload(snap)
+            );
+            void safeSend(ch, snapEv);
+          }
+
+          if (evUnknown.type === "CUSTOMER_SCANNED") {
+            // Customer scan simulation arrives here
+            const sid = sessionIdRef.current;
+            const snap = snapshotRef.current;
+            if (!sid || !snap) return;
+
+            const p = evUnknown.payload as Record<string, unknown>;
+            const outcome = (p.outcome === "success" ? "SUCCESS" : "FAIL") as
+              | "SUCCESS"
+              | "FAIL";
+            const message =
+              typeof p.message === "string"
+                ? p.message
+                : outcome === "SUCCESS"
+                ? "Receipt linked to wallet (simulated)."
+                : "Scan failed (simulated).";
+
+            const nextSnap: PosSimSnapshot = {
+              ...snap,
+              scan: {
+                state: outcome,
+                scanned_at: new Date().toISOString(),
+                message,
+              },
+            };
+
+            setHostStatus(
+              outcome === "SUCCESS"
+                ? "Customer scan success"
+                : "Customer scan failed"
+            );
+
+            await persistAndBroadcast(nextSnap, "CUSTOMER_SCANNED", {
+              outcome: outcome === "SUCCESS" ? "success" : "fail",
+              message,
+            } as unknown as JsonObject);
+          }
         }
-      });
+      );
 
       ch.subscribe(async (st: SubscribeStatus) => {
         if (st === "SUBSCRIBED") {
           setHostStatus("Live");
+
+          // Durable + broadcast markers
+          await logDbEvent("SESSION_CREATED", {
+            session_code,
+            customer_url,
+            mode: "web_pos",
+          } as unknown as JsonObject);
 
           const createdEv = makeEvent("SESSION_CREATED", session_id, {
             session_code,
@@ -296,7 +479,10 @@ export default function WebPosSimPageA4() {
       },
     };
 
-    void persistAndBroadcast(nextSnap);
+    void persistAndBroadcast(nextSnap, "CART_UPDATED", {
+      items_count: items.length,
+      total: totals.total,
+    } as unknown as JsonObject);
   }
 
   function decItem(line_no: number) {
@@ -326,7 +512,10 @@ export default function WebPosSimPageA4() {
       cart: { currency: snap.cart.currency ?? "EUR", items, ...totals },
     };
 
-    void persistAndBroadcast(nextSnap);
+    void persistAndBroadcast(nextSnap, "CART_UPDATED", {
+      items_count: items.length,
+      total: totals.total,
+    } as unknown as JsonObject);
   }
 
   function incItem(line_no: number) {
@@ -350,7 +539,10 @@ export default function WebPosSimPageA4() {
       cart: { currency: snap.cart.currency ?? "EUR", items, ...totals },
     };
 
-    void persistAndBroadcast(nextSnap);
+    void persistAndBroadcast(nextSnap, "CART_UPDATED", {
+      items_count: items.length,
+      total: totals.total,
+    } as unknown as JsonObject);
   }
 
   function clearCart() {
@@ -371,7 +563,7 @@ export default function WebPosSimPageA4() {
       },
     };
 
-    void persistAndBroadcast(nextSnap);
+    void persistAndBroadcast(nextSnap, "CART_CLEARED", {} as JsonObject);
   }
 
   function updateToggle<K extends keyof PosSimSnapshot["toggles"]>(
@@ -386,7 +578,10 @@ export default function WebPosSimPageA4() {
       toggles: { ...snap.toggles, [key]: value },
     };
 
-    void persistAndBroadcast(nextSnap);
+    void persistAndBroadcast(nextSnap, "SNAPSHOT_SYNC", {
+      toggle: String(key),
+      value: String(value),
+    } as unknown as JsonObject);
   }
 
   function goToCheckout() {
@@ -401,10 +596,14 @@ export default function WebPosSimPageA4() {
     const nextSnap: PosSimSnapshot = {
       ...snap,
       flow: { ...snap.flow, stage: "CHECKOUT", payment_state: "INITIATED" },
+      scan: { state: "NONE" },
     };
 
     setHostStatus("Checkout initiated");
-    void persistAndBroadcast(nextSnap);
+    void persistAndBroadcast(nextSnap, "CHECKOUT_INITIATED", {
+      total: Number(nextSnap.cart.total ?? 0),
+      currency: nextSnap.cart.currency ?? "EUR",
+    } as unknown as JsonObject);
   }
 
   function backToCart() {
@@ -418,7 +617,9 @@ export default function WebPosSimPageA4() {
     };
 
     setHostStatus("Back to cart");
-    void persistAndBroadcast(nextSnap);
+    void persistAndBroadcast(nextSnap, "SNAPSHOT_SYNC", {
+      stage: "CART",
+    } as JsonObject);
   }
 
   function newSale() {
@@ -437,6 +638,7 @@ export default function WebPosSimPageA4() {
       active_sale_id: newSaleId(),
       flow: { stage: "CART", payment_state: "IDLE", issuance_state: "IDLE" },
       receipt: null,
+      scan: { state: "NONE" },
       fallback: { printed: false, print_reason: null },
       cart: {
         currency: snap.cart.currency ?? "EUR",
@@ -448,7 +650,9 @@ export default function WebPosSimPageA4() {
     };
 
     setHostStatus("New sale started");
-    void persistAndBroadcast(nextSnap);
+    void persistAndBroadcast(nextSnap, "NEW_SALE_STARTED", {
+      sale_id: nextSnap.active_sale_id ?? null,
+    } as unknown as JsonObject);
   }
 
   function pay() {
@@ -470,7 +674,6 @@ export default function WebPosSimPageA4() {
       payTimerRef.current = null;
     }
 
-    // Reset receipt issuance state on new pay attempt
     issuingRef.current = false;
 
     if (snap.toggles.network_mode === "down") {
@@ -479,13 +682,16 @@ export default function WebPosSimPageA4() {
         flow: { ...snap.flow, stage: "RESULT", payment_state: "NETWORK_ERROR" },
       };
       setHostStatus("Network down (simulated)");
-      void persistAndBroadcast(nextSnap);
+      void persistAndBroadcast(nextSnap, "PAYMENT_RESULT", {
+        state: "NETWORK_ERROR",
+      } as unknown as JsonObject);
       return;
     }
 
     const processingSnap: PosSimSnapshot = {
       ...snap,
       receipt: null,
+      scan: { state: "NONE" },
       fallback: { printed: false, print_reason: null },
       flow: {
         ...snap.flow,
@@ -496,7 +702,10 @@ export default function WebPosSimPageA4() {
     };
 
     setHostStatus("Processing payment...");
-    void persistAndBroadcast(processingSnap);
+    void persistAndBroadcast(processingSnap, "PAYMENT_PROCESSING", {
+      total: Number(processingSnap.cart.total ?? 0),
+      currency: processingSnap.cart.currency ?? "EUR",
+    } as unknown as JsonObject);
 
     const slow = snap.toggles.network_mode === "slow";
     const baseDelay = slow ? 3500 : 1500;
@@ -529,7 +738,9 @@ export default function WebPosSimPageA4() {
           : "Payment timed out"
       );
 
-      void persistAndBroadcast(resultSnap);
+      void persistAndBroadcast(resultSnap, "PAYMENT_RESULT", {
+        state: finalState,
+      } as unknown as JsonObject);
     }, delay);
   }
 
@@ -554,9 +765,10 @@ export default function WebPosSimPageA4() {
     };
 
     setHostStatus("Issuing receipt (real receipt-ingest)...");
-    await persistAndBroadcast(ingestingSnap);
+    await persistAndBroadcast(ingestingSnap, "RECEIPT_ISSUANCE_STARTED", {
+      sale_id: ingestingSnap.active_sale_id ?? null,
+    } as unknown as JsonObject);
 
-    // Build payload aligned with your receipt-ingest edge function
     const payload = {
       retailer_id: snap.terminal.retailer_id,
       store_id: snap.terminal.store_id,
@@ -613,29 +825,37 @@ export default function WebPosSimPageA4() {
       if (!token_id || !public_url)
         throw new Error("Invalid receipt-ingest response shape");
 
+      const base = getSnap()!;
       const nextSnap: PosSimSnapshot = {
-        ...getSnap()!,
-        flow: { ...getSnap()!.flow, issuance_state: "TOKEN_READY" },
+        ...base,
+        flow: { ...base.flow, issuance_state: "TOKEN_READY" },
         receipt: {
           token_id,
           public_url,
           qr_url: qr_url ?? public_url,
           preview_url,
         },
+        scan: { state: "PENDING" },
       };
 
       setHostStatus("Receipt token ready");
-      await persistAndBroadcast(nextSnap);
+      await persistAndBroadcast(nextSnap, "RECEIPT_TOKEN_READY", {
+        token_id,
+        public_url,
+      } as unknown as JsonObject);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
 
+      const base = getSnap()!;
       const failedSnap: PosSimSnapshot = {
-        ...getSnap()!,
-        flow: { ...getSnap()!.flow, issuance_state: "FAILED" },
+        ...base,
+        flow: { ...base.flow, issuance_state: "FAILED" },
       };
 
       setHostStatus(`Receipt issuance failed: ${msg}`);
-      await persistAndBroadcast(failedSnap);
+      await persistAndBroadcast(failedSnap, "RECEIPT_ISSUANCE_FAILED", {
+        message: msg,
+      } as unknown as JsonObject);
     } finally {
       issuingRef.current = false;
     }
@@ -679,12 +899,13 @@ export default function WebPosSimPageA4() {
   const issuanceState = snap?.flow.issuance_state ?? "IDLE";
 
   return (
-    <div style={{ padding: 24, maxWidth: 1040 }}>
+    <div style={{ padding: 24, maxWidth: 1240 }}>
       <h1 style={{ fontSize: 22, fontWeight: 800 }}>
         Receiptless POS Simulator — Web POS (A4)
       </h1>
       <p style={{ marginTop: 8 }}>
-        Milestone A4: real receipt-ingest + real token + customer QR.
+        Canonical: <b>pos_sim_sessions.snapshot_json</b>. Durable timeline:{" "}
+        <b>pos_sim_events</b>. Broadcast stays for instant sync.
       </p>
 
       <div style={{ marginTop: 10, fontSize: 13, opacity: 0.85 }}>
@@ -751,6 +972,12 @@ export default function WebPosSimPageA4() {
                   Issuance
                 </div>
                 <div style={{ fontWeight: 900 }}>{issuanceState}</div>
+                <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
+                  Scan
+                </div>
+                <div style={{ fontWeight: 900 }}>
+                  {snap?.scan?.state ?? "—"}
+                </div>
               </div>
             </div>
 
@@ -776,7 +1003,6 @@ export default function WebPosSimPageA4() {
 
             <hr style={{ margin: "14px 0" }} />
 
-            {/* Toggles */}
             <div style={{ fontSize: 14, fontWeight: 900, marginBottom: 8 }}>
               Demo Toggles
             </div>
@@ -827,11 +1053,34 @@ export default function WebPosSimPageA4() {
                   <option value="down">Down</option>
                 </select>
               </label>
+
+              <label style={{ display: "grid", gap: 6 }}>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>
+                  Customer Scan Sim
+                </div>
+                <select
+                  value={snap?.toggles.customer_scan_sim ?? "none"}
+                  onChange={(e) =>
+                    updateToggle(
+                      "customer_scan_sim",
+                      e.target.value as "none" | "auto_success" | "auto_fail"
+                    )
+                  }
+                  style={{
+                    padding: 10,
+                    borderRadius: 10,
+                    border: "1px solid #ccc",
+                  }}
+                >
+                  <option value="none">None</option>
+                  <option value="auto_success">Auto Success</option>
+                  <option value="auto_fail">Auto Fail</option>
+                </select>
+              </label>
             </div>
 
             <hr style={{ margin: "14px 0" }} />
 
-            {/* Catalog */}
             <div style={{ fontSize: 14, fontWeight: 900, marginBottom: 8 }}>
               Demo Catalog
             </div>
@@ -915,7 +1164,6 @@ export default function WebPosSimPageA4() {
               </div>
             </div>
 
-            {/* Action bar */}
             <div
               style={{
                 marginTop: 12,
@@ -1005,7 +1253,6 @@ export default function WebPosSimPageA4() {
               </button>
             </div>
 
-            {/* Cart list */}
             <div style={{ marginTop: 14 }}>
               {(session.snapshot.cart.items ?? []).length === 0 ? (
                 <div style={{ fontSize: 13, opacity: 0.8 }}>Cart is empty.</div>
@@ -1087,7 +1334,6 @@ export default function WebPosSimPageA4() {
               )}
             </div>
 
-            {/* Totals */}
             <div
               style={{
                 marginTop: 14,
@@ -1128,7 +1374,6 @@ export default function WebPosSimPageA4() {
               </div>
             </div>
 
-            {/* Receipt panel */}
             <div style={{ marginTop: 14 }}>
               <div style={{ fontWeight: 900 }}>Receipt</div>
               {issuanceState === "IDLE" && (
@@ -1165,7 +1410,6 @@ export default function WebPosSimPageA4() {
               )}
             </div>
 
-            {/* Debug */}
             <div style={{ marginTop: 14, fontSize: 12, opacity: 0.7 }}>
               Snapshot (debug)
             </div>
@@ -1179,6 +1423,76 @@ export default function WebPosSimPageA4() {
             >
               {JSON.stringify(session.snapshot, null, 2)}
             </pre>
+          </div>
+
+          {/* Timeline column */}
+          <div
+            style={{
+              flex: 0.9,
+              minWidth: 360,
+              border: "1px solid #ddd",
+              borderRadius: 12,
+              padding: 14,
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: 10,
+              }}
+            >
+              <div style={{ fontWeight: 900 }}>Lifecycle Timeline</div>
+              <div style={{ fontSize: 12, opacity: 0.7 }}>
+                {timeline.length} events
+              </div>
+            </div>
+
+            <div style={{ marginTop: 10, maxHeight: 760, overflow: "auto" }}>
+              {timeline.length === 0 ? (
+                <div style={{ fontSize: 13, opacity: 0.8 }}>
+                  No events yet (or history not loaded).
+                </div>
+              ) : (
+                <div style={{ display: "grid", gap: 8 }}>
+                  {timeline.map((e) => (
+                    <div
+                      key={e.id}
+                      style={{
+                        border: "1px solid #eee",
+                        borderRadius: 10,
+                        padding: 10,
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          gap: 10,
+                        }}
+                      >
+                        <div style={{ fontWeight: 900 }}>{e.event_type}</div>
+                        <div style={{ fontSize: 12, opacity: 0.7 }}>
+                          {fmtTime(e.created_at)}
+                        </div>
+                      </div>
+                      <div
+                        style={{ marginTop: 6, fontSize: 12, opacity: 0.85 }}
+                      >
+                        {shortJson(e.payload)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div style={{ marginTop: 10, fontSize: 12, opacity: 0.7 }}>
+              Durable source:{" "}
+              <span style={{ fontFamily: "monospace" }}>
+                public.pos_sim_events
+              </span>
+            </div>
           </div>
         </div>
       )}

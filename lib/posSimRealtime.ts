@@ -1,5 +1,10 @@
 // lib/posSimRealtime.ts
-import type { JsonObject, PosSimEvent, PosSimEventType, PosSimSnapshot } from "./posSimTypes";
+import type {
+  JsonObject,
+  PosSimEvent,
+  PosSimEventType,
+  PosSimSnapshot,
+} from "./posSimTypes";
 
 export function channelName(sessionId: string): string {
   return `pos-sim:${sessionId}`;

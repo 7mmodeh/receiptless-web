@@ -51,6 +51,14 @@ export type ReceiptInfo = {
   preview_url?: string | null;
 };
 
+export type ReceiptScanState = "NONE" | "PENDING" | "SUCCESS" | "FAIL";
+
+export type ReceiptScanInfo = {
+  state: ReceiptScanState;
+  scanned_at?: string | null;
+  message?: string | null;
+};
+
 export type PosSimSnapshot = {
   session_id: string | null;
   session_code: string;
@@ -78,6 +86,9 @@ export type PosSimSnapshot = {
 
   receipt: ReceiptInfo | null;
 
+  // Customer scan simulation state (optional; stored inside snapshot_json)
+  scan?: ReceiptScanInfo | null;
+
   fallback: {
     printed: boolean;
     print_reason: null | "NETWORK" | "ISSUANCE_FAIL" | "CUSTOMER_REQUEST";
@@ -88,6 +99,15 @@ export type PosSimEventType =
   | "SESSION_CREATED"
   | "CUSTOMER_JOINED"
   | "CART_UPDATED"
+  | "CHECKOUT_INITIATED"
+  | "PAYMENT_PROCESSING"
+  | "PAYMENT_RESULT"
+  | "RECEIPT_ISSUANCE_STARTED"
+  | "RECEIPT_TOKEN_READY"
+  | "RECEIPT_ISSUANCE_FAILED"
+  | "CUSTOMER_SCANNED"
+  | "NEW_SALE_STARTED"
+  | "CART_CLEARED"
   | "SNAPSHOT_SYNC"
   | "RESET_REQUESTED";
 
@@ -122,6 +142,15 @@ export type BroadcastMessage = {
   payload: unknown;
 };
 
+// Durable DB timeline row (public.pos_sim_events)
+export type PosSimDbEvent = {
+  id: string;
+  session_id: string;
+  event_type: string;
+  payload: JsonObject;
+  created_at: string;
+};
+
 // --- Receipt issuance request body (matches /api/pos-sim/issue-receipt exactly) ---
 export type IssueReceiptBody = {
   retailer_id: string;
@@ -138,6 +167,5 @@ export type IssueReceiptBody = {
 
   items: CartItem[];
 };
-
 
 export type IssueReceiptResponse = unknown;
