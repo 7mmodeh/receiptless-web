@@ -212,7 +212,7 @@ export default function CustomerDisplayPage() {
     await ch.send({ type: "broadcast", event: "pos_sim", payload: ev });
   }
 
-  // Auto scan simulation (optional)
+  // Auto scan simulation
   useEffect(() => {
     if (!snapshot) return;
     const receiptUrl = snapshot.receipt?.public_url ?? null;
@@ -221,10 +221,8 @@ export default function CustomerDisplayPage() {
     const mode = snapshot.toggles.customer_scan_sim ?? "none";
     if (mode === "none") return;
 
-    // only once per page load
     if (autoScanRef.current) return;
 
-    // only if scan is not already final
     const scanState = snapshot.scan?.state ?? "NONE";
     if (scanState === "SUCCESS" || scanState === "FAIL") return;
 
@@ -259,6 +257,13 @@ export default function CustomerDisplayPage() {
     !!receiptUrl &&
     !(scanState === "SUCCESS" || scanState === "FAIL") &&
     status === "Live";
+
+  function scanOutcomeFromToggle(): "success" | "fail" {
+    const mode = snapshot?.toggles.customer_scan_sim ?? "none";
+    if (mode === "auto_fail") return "fail";
+    if (mode === "auto_success") return "success";
+    return "success"; // manual default
+  }
 
   return (
     <div
@@ -381,8 +386,7 @@ export default function CustomerDisplayPage() {
                   <button
                     disabled={!canScan}
                     onClick={() => {
-                      const mode = snapshot.toggles.customer_scan_sim ?? "none";
-                      const outcome = mode === "auto_fail" ? "fail" : "success";
+                      const outcome = scanOutcomeFromToggle();
                       void broadcastScan(outcome);
                     }}
                     style={{
@@ -399,7 +403,11 @@ export default function CustomerDisplayPage() {
                   </button>
 
                   <div
-                    style={{ fontSize: 12, opacity: 0.7, alignSelf: "center" }}
+                    style={{
+                      fontSize: 12,
+                      opacity: 0.7,
+                      alignSelf: "center",
+                    }}
                   >
                     Toggle drives outcome:{" "}
                     <b>{snapshot.toggles.customer_scan_sim ?? "none"}</b>
@@ -466,7 +474,11 @@ export default function CustomerDisplayPage() {
                     {snapshot.scan?.message && (
                       <>
                         <div
-                          style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}
+                          style={{
+                            marginTop: 10,
+                            fontSize: 12,
+                            opacity: 0.75,
+                          }}
                         >
                           Scan message
                         </div>

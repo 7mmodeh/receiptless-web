@@ -112,6 +112,20 @@ function shortJson(v: unknown) {
   }
 }
 
+// Remove undefined values (jsonb cannot store undefined, and supabase can choke on it)
+function stripUndefined(obj: unknown): unknown {
+  if (Array.isArray(obj)) return obj.map(stripUndefined);
+  if (obj && typeof obj === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+      if (v === undefined) continue;
+      out[k] = stripUndefined(v);
+    }
+    return out;
+  }
+  return obj;
+}
+
 export default function WebPosSimPageA4() {
   const supabase = useMemo(() => getSupabaseClient(), []);
 
@@ -126,6 +140,7 @@ export default function WebPosSimPageA4() {
 
   // Durable timeline
   const [timeline, setTimeline] = useState<PosSimDbEvent[]>([]);
+  const [timelineWriteStatus, setTimelineWriteStatus] = useState<string>("—");
   const timelineChRef = useRef<RealtimeChannel | null>(null);
 
   const channelRef = useRef<RealtimeChannel | null>(null);
@@ -166,20 +181,30 @@ export default function WebPosSimPageA4() {
     const sid = sessionIdRef.current;
     if (!sid) return;
 
+    setTimelineWriteStatus("writing…");
+
+    const safePayload = stripUndefined(payload) as JsonObject;
+
     const { data, error } = await supabase
       .from("pos_sim_events")
-      .insert([{ session_id: sid, event_type, payload }])
+      .insert([{ session_id: sid, event_type, payload: safePayload }])
       .select("id, session_id, event_type, payload, created_at")
-      .maybeSingle();
+      .single();
 
     if (error) {
-      // non-fatal; timeline still works via broadcast
-      console.warn("pos_sim_events insert failed:", error.message);
+      setTimelineWriteStatus(`FAILED: ${error.message}`);
+      console.error("pos_sim_events insert failed:", error);
+      // This is why you were seeing 0 events — now it will be visible.
       return;
     }
 
+    setTimelineWriteStatus("ok");
+
     if (data) {
-      setTimeline((prev) => [...prev, data as unknown as PosSimDbEvent]);
+      setTimeline((prev) => {
+        if (prev.some((e) => e.id === (data as any).id)) return prev;
+        return [...prev, data as unknown as PosSimDbEvent];
+      });
     }
   }
 
@@ -192,11 +217,14 @@ export default function WebPosSimPageA4() {
       .order("created_at", { ascending: true })
       .limit(400);
 
-    if (!error && Array.isArray(data)) {
+    if (error) {
+      setTimelineWriteStatus(`read FAILED: ${error.message}`);
+    } else if (Array.isArray(data)) {
       setTimeline(data as unknown as PosSimDbEvent[]);
+      setTimelineWriteStatus("read ok");
     }
 
-    // Subscribe to inserts (durable realtime)
+    // Subscribe to inserts (requires Supabase Realtime enabled for table)
     if (timelineChRef.current) {
       supabase.removeChannel(timelineChRef.current);
       timelineChRef.current = null;
@@ -216,14 +244,19 @@ export default function WebPosSimPageA4() {
       (payload) => {
         const row = payload.new as unknown as PosSimDbEvent;
         setTimeline((prev) => {
-          // de-dupe by id
           if (prev.some((e) => e.id === row.id)) return prev;
           return [...prev, row];
         });
       }
     );
 
-    tch.subscribe();
+    tch.subscribe((st) => {
+      // If this table is not enabled for realtime, you will not get inserts here.
+      // History will still show if inserts work.
+      if (st === "CHANNEL_ERROR") {
+        setTimelineWriteStatus((s) => `${s} | realtime CHANNEL_ERROR`);
+      }
+    });
   }
 
   async function persistSnapshot(nextSnap: PosSimSnapshot) {
@@ -234,7 +267,6 @@ export default function WebPosSimPageA4() {
     snapshotRef.current = nextSnap;
     setSession((prev) => (prev ? { ...prev, snapshot: nextSnap } : prev));
 
-    // Canonical snapshot
     const { error: upErr } = await supabase
       .from("pos_sim_sessions")
       .update({ snapshot_json: nextSnap })
@@ -245,7 +277,6 @@ export default function WebPosSimPageA4() {
       setHostStatus(`DB update failed: ${upErr.message}`);
     }
 
-    // Broadcast for instant sync (customer display)
     const snapEv = makeEvent("SNAPSHOT_SYNC", sid, snapshotPayload(nextSnap));
     await safeSend(ch, snapEv);
   }
@@ -257,24 +288,42 @@ export default function WebPosSimPageA4() {
   ) {
     await persistSnapshot(nextSnap);
 
-    // Durable timeline event (optional)
     if (event_type) {
       await logDbEvent(event_type, event_payload ?? ({} as JsonObject));
     }
+  }
 
-    // Broadcast a light event for listeners (optional)
-    const sid = sessionIdRef.current;
-    const ch = channelRef.current;
-    if (!sid || !ch) return;
+  function canAutoFallbackPrint(snap: PosSimSnapshot) {
+    return (
+      snap.toggles.print_fallback === "enabled" &&
+      snap.flow.payment_state === "APPROVED" &&
+      !snap.fallback.printed
+    );
+  }
 
-    if (event_type) {
-      const ev = makeEvent(
-        "CART_UPDATED", // keep compatibility with existing listeners
-        sid,
-        { event_type, ...(event_payload ?? {}) } as unknown as JsonObject
+  async function fallbackPrint(
+    reason: "NETWORK" | "ISSUANCE_FAIL" | "CUSTOMER_REQUEST" | "SCAN_FAIL"
+  ) {
+    const snap = getSnap();
+    if (!snap) return;
+
+    if (!canAutoFallbackPrint(snap)) {
+      setHostStatus(
+        "Fallback print not allowed (toggle disabled / not approved / already printed)"
       );
-      await safeSend(ch, ev);
+      return;
     }
+
+    const nextSnap: PosSimSnapshot = {
+      ...snap,
+      fallback: { printed: true, print_reason: reason },
+      flow: { ...snap.flow, issuance_state: "FALLBACK_PRINTED" },
+    };
+
+    setHostStatus(`Printed paper receipt (${reason})`);
+    await persistAndBroadcast(nextSnap, "FALLBACK_PRINTED", {
+      reason,
+    } as unknown as JsonObject);
   }
 
   async function startSession() {
@@ -315,7 +364,6 @@ export default function WebPosSimPageA4() {
       snapshotRef.current = snapshot;
       sessionIdRef.current = session_id;
 
-      // Load and subscribe timeline
       await loadTimelineAndSubscribe(session_id);
 
       if (channelRef.current) {
@@ -355,7 +403,6 @@ export default function WebPosSimPageA4() {
           }
 
           if (evUnknown.type === "CUSTOMER_SCANNED") {
-            // Customer scan simulation arrives here
             const sid = sessionIdRef.current;
             const snap = snapshotRef.current;
             if (!sid || !snap) return;
@@ -390,6 +437,11 @@ export default function WebPosSimPageA4() {
               outcome: outcome === "SUCCESS" ? "success" : "fail",
               message,
             } as unknown as JsonObject);
+
+            // Rule #2: payment success + scan fail => fallback print
+            if (outcome === "FAIL" && canAutoFallbackPrint(nextSnap)) {
+              await fallbackPrint("SCAN_FAIL");
+            }
           }
         }
       );
@@ -398,7 +450,6 @@ export default function WebPosSimPageA4() {
         if (st === "SUBSCRIBED") {
           setHostStatus("Live");
 
-          // Durable + broadcast markers
           await logDbEvent("SESSION_CREATED", {
             session_code,
             customer_url,
@@ -561,6 +612,9 @@ export default function WebPosSimPageA4() {
         vat_total: 0,
         total: 0,
       },
+      scan: { state: "NONE" },
+      fallback: { printed: false, print_reason: null },
+      receipt: null,
     };
 
     void persistAndBroadcast(nextSnap, "CART_CLEARED", {} as JsonObject);
@@ -597,6 +651,7 @@ export default function WebPosSimPageA4() {
       ...snap,
       flow: { ...snap.flow, stage: "CHECKOUT", payment_state: "INITIATED" },
       scan: { state: "NONE" },
+      fallback: { printed: false, print_reason: null },
     };
 
     setHostStatus("Checkout initiated");
@@ -619,7 +674,7 @@ export default function WebPosSimPageA4() {
     setHostStatus("Back to cart");
     void persistAndBroadcast(nextSnap, "SNAPSHOT_SYNC", {
       stage: "CART",
-    } as JsonObject);
+    } as unknown as JsonObject);
   }
 
   function newSale() {
@@ -685,6 +740,9 @@ export default function WebPosSimPageA4() {
       void persistAndBroadcast(nextSnap, "PAYMENT_RESULT", {
         state: "NETWORK_ERROR",
       } as unknown as JsonObject);
+
+      // Rule #2: network fail -> fallback print (if payment was already approved; in this branch it isn't)
+      // Here, payment never approved; so we do NOT print.
       return;
     }
 
@@ -741,6 +799,8 @@ export default function WebPosSimPageA4() {
       void persistAndBroadcast(resultSnap, "PAYMENT_RESULT", {
         state: finalState,
       } as unknown as JsonObject);
+
+      // If you ever decide "timeout but money taken" => approved, that logic would go here.
     }, delay);
   }
 
@@ -856,6 +916,11 @@ export default function WebPosSimPageA4() {
       await persistAndBroadcast(failedSnap, "RECEIPT_ISSUANCE_FAILED", {
         message: msg,
       } as unknown as JsonObject);
+
+      // Rule #2: payment success + issuance fail => fallback print
+      if (canAutoFallbackPrint(failedSnap)) {
+        await fallbackPrint("ISSUANCE_FAIL");
+      }
     } finally {
       issuingRef.current = false;
     }
@@ -897,6 +962,13 @@ export default function WebPosSimPageA4() {
   const stage = snap?.flow.stage ?? "BOOT";
   const payState = snap?.flow.payment_state ?? "IDLE";
   const issuanceState = snap?.flow.issuance_state ?? "IDLE";
+  const scanState = snap?.scan?.state ?? "—";
+
+  const showPrintButton =
+    !!snap &&
+    snap.flow.payment_state === "APPROVED" &&
+    snap.toggles.print_fallback === "enabled" &&
+    !snap.fallback.printed;
 
   return (
     <div style={{ padding: 24, maxWidth: 1240 }}>
@@ -910,6 +982,9 @@ export default function WebPosSimPageA4() {
 
       <div style={{ marginTop: 10, fontSize: 13, opacity: 0.85 }}>
         Host Status: <b>{hostStatus}</b>
+        <span style={{ marginLeft: 10, opacity: 0.8 }}>
+          Timeline: <b>{timelineWriteStatus}</b>
+        </span>
       </div>
 
       {!session ? (
@@ -934,7 +1009,12 @@ export default function WebPosSimPageA4() {
         </div>
       ) : (
         <div
-          style={{ marginTop: 18, display: "flex", gap: 16, flexWrap: "wrap" }}
+          style={{
+            marginTop: 18,
+            display: "flex",
+            gap: 16,
+            flexWrap: "wrap",
+          }}
         >
           {/* Left column */}
           <div
@@ -975,9 +1055,7 @@ export default function WebPosSimPageA4() {
                 <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
                   Scan
                 </div>
-                <div style={{ fontWeight: 900 }}>
-                  {snap?.scan?.state ?? "—"}
-                </div>
+                <div style={{ fontWeight: 900 }}>{scanState}</div>
               </div>
             </div>
 
@@ -1051,6 +1129,27 @@ export default function WebPosSimPageA4() {
                   <option value="normal">Normal</option>
                   <option value="slow">Slow</option>
                   <option value="down">Down</option>
+                </select>
+              </label>
+
+              <label style={{ display: "grid", gap: 6 }}>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>Print Fallback</div>
+                <select
+                  value={snap?.toggles.print_fallback ?? "enabled"}
+                  onChange={(e) =>
+                    updateToggle(
+                      "print_fallback",
+                      e.target.value as "enabled" | "disabled"
+                    )
+                  }
+                  style={{
+                    padding: 10,
+                    borderRadius: 10,
+                    border: "1px solid #ccc",
+                  }}
+                >
+                  <option value="enabled">Enabled</option>
+                  <option value="disabled">Disabled</option>
                 </select>
               </label>
 
@@ -1251,6 +1350,23 @@ export default function WebPosSimPageA4() {
                   ? "Issuing..."
                   : "Issue Receipt (Real)"}
               </button>
+
+              {/* Rule #1: print button after pay success */}
+              <button
+                onClick={() => void fallbackPrint("CUSTOMER_REQUEST")}
+                disabled={!showPrintButton}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #555",
+                  background: "white",
+                  fontWeight: 900,
+                  opacity: showPrintButton ? 1 : 0.6,
+                }}
+                title="Print paper receipt on POS terminal (simulated)"
+              >
+                Print Paper Receipt
+              </button>
             </div>
 
             <div style={{ marginTop: 14 }}>
@@ -1376,6 +1492,19 @@ export default function WebPosSimPageA4() {
 
             <div style={{ marginTop: 14 }}>
               <div style={{ fontWeight: 900 }}>Receipt</div>
+
+              {/* Fallback state visibility */}
+              {snap?.fallback?.printed ? (
+                <div style={{ marginTop: 6, opacity: 0.9 }}>
+                  <b>Paper receipt printed</b> — reason:{" "}
+                  <b>{snap.fallback.print_reason ?? "—"}</b>
+                </div>
+              ) : (
+                <div style={{ marginTop: 6, opacity: 0.75 }}>
+                  Paper receipt not printed.
+                </div>
+              )}
+
               {issuanceState === "IDLE" && (
                 <div style={{ opacity: 0.8, marginTop: 6 }}>
                   Not issued yet.
@@ -1389,7 +1518,8 @@ export default function WebPosSimPageA4() {
               {issuanceState === "FAILED" && (
                 <div style={{ opacity: 0.85, marginTop: 6 }}>
                   Issuance failed. You can retry with{" "}
-                  <b>Issue Receipt (Real)</b>.
+                  <b>Issue Receipt (Real)</b>. Fallback print will auto-trigger
+                  if enabled.
                 </div>
               )}
               {issuanceState === "TOKEN_READY" && snap?.receipt && (
@@ -1448,10 +1578,18 @@ export default function WebPosSimPageA4() {
               </div>
             </div>
 
+            <div style={{ marginTop: 6, fontSize: 12, opacity: 0.75 }}>
+              Durable source:{" "}
+              <span style={{ fontFamily: "monospace" }}>
+                public.pos_sim_events
+              </span>
+            </div>
+
             <div style={{ marginTop: 10, maxHeight: 760, overflow: "auto" }}>
               {timeline.length === 0 ? (
                 <div style={{ fontSize: 13, opacity: 0.8 }}>
-                  No events yet (or history not loaded).
+                  No events yet. If Timeline status shows FAILED, the insert is
+                  failing — copy that error.
                 </div>
               ) : (
                 <div style={{ display: "grid", gap: 8 }}>
@@ -1485,13 +1623,6 @@ export default function WebPosSimPageA4() {
                   ))}
                 </div>
               )}
-            </div>
-
-            <div style={{ marginTop: 10, fontSize: 12, opacity: 0.7 }}>
-              Durable source:{" "}
-              <span style={{ fontFamily: "monospace" }}>
-                public.pos_sim_events
-              </span>
             </div>
           </div>
         </div>

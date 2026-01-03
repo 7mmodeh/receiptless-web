@@ -86,12 +86,12 @@ export type PosSimSnapshot = {
 
   receipt: ReceiptInfo | null;
 
-  // Customer scan simulation state (optional; stored inside snapshot_json)
+  // Customer scan simulation state (stored inside snapshot_json)
   scan?: ReceiptScanInfo | null;
 
   fallback: {
     printed: boolean;
-    print_reason: null | "NETWORK" | "ISSUANCE_FAIL" | "CUSTOMER_REQUEST";
+    print_reason: null | "NETWORK" | "ISSUANCE_FAIL" | "CUSTOMER_REQUEST" | "SCAN_FAIL";
   };
 };
 
@@ -106,6 +106,7 @@ export type PosSimEventType =
   | "RECEIPT_TOKEN_READY"
   | "RECEIPT_ISSUANCE_FAILED"
   | "CUSTOMER_SCANNED"
+  | "FALLBACK_PRINTED"
   | "NEW_SALE_STARTED"
   | "CART_CLEARED"
   | "SNAPSHOT_SYNC"
@@ -114,7 +115,6 @@ export type PosSimEventType =
 /**
  * JSON payload type used for events.
  * Non-recursive on purpose to avoid TS(2456) in some TS configs.
- * Still prevents `any` and is sufficient for our simulator payloads.
  */
 export type JsonValue =
   | string
@@ -136,13 +136,11 @@ export type PosSimEvent = {
   payload: JsonObject;
 };
 
-// Broadcast wrapper Supabase gives to the callback
 export type BroadcastMessage = {
   event: string;
   payload: unknown;
 };
 
-// Durable DB timeline row (public.pos_sim_events)
 export type PosSimDbEvent = {
   id: string;
   session_id: string;
