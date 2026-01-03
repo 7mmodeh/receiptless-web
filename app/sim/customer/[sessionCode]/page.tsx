@@ -74,6 +74,7 @@ export default function CustomerDisplayPage() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [snapshot, setSnapshot] = useState<PosSimSnapshot | null>(null);
   const [status, setStatus] = useState<string>("Connecting...");
+  const [scanSendStatus, setScanSendStatus] = useState<string>("");
 
   const channelRef = useRef<RealtimeChannel | null>(null);
 
@@ -85,6 +86,69 @@ export default function CustomerDisplayPage() {
     const tc = snapshot?.terminal?.terminal_code;
     return tc ? `Customer Display — ${tc}` : "Customer Display";
   }, [snapshot]);
+
+  function canSendScan(): boolean {
+    if (!snapshot) return false;
+    if (!sessionId) return false;
+    if (!channelRef.current) return false;
+    const tokenId = snapshot.receipt?.token_id ?? null;
+    if (!tokenId) return false;
+
+    // If host already recorded a terminal scan result, do not re-send
+    const scanState = snapshot.scan?.state ?? "NONE";
+    if (scanState === "SUCCESS" || scanState === "FAIL") return false;
+
+    // Only meaningful when token exists; allow while PENDING / NONE
+    return true;
+  }
+
+  async function sendScan(outcome: "success" | "fail") {
+    const ch = channelRef.current;
+    const snap = snapshot;
+    const sid = sessionId;
+
+    if (!ch || !snap || !sid) return;
+
+    const tokenId = snap.receipt?.token_id ?? null;
+    if (!tokenId) return;
+
+    // If host already recorded a terminal scan result, do not re-send
+    const scanState = snap.scan?.state ?? "NONE";
+    if (scanState === "SUCCESS" || scanState === "FAIL") return;
+
+    setScanSendStatus("Sending scan…");
+
+    const message =
+      outcome === "success"
+        ? "Receipt linked to wallet (simulated)."
+        : "Scan failed (simulated).";
+
+    const ev = makeEvent("CUSTOMER_SCANNED", sid, {
+      outcome,
+      message,
+      token_id: tokenId,
+    } satisfies JsonObject);
+
+    try {
+      const res = await ch.send({
+        type: "broadcast",
+        event: "pos_sim",
+        payload: ev,
+      });
+
+      if (res === "ok") {
+        setScanSendStatus(
+          outcome === "success" ? "Scan sent: success" : "Scan sent: fail"
+        );
+      } else {
+        setScanSendStatus(`Scan send error: ${String(res)}`);
+      }
+    } catch (e: unknown) {
+      setScanSendStatus(`Scan send error: ${toStatus(e)}`);
+    } finally {
+      window.setTimeout(() => setScanSendStatus(""), 1500);
+    }
+  }
 
   useEffect(() => {
     if (!POS_SIM_ENABLED) return;
@@ -202,7 +266,7 @@ export default function CustomerDisplayPage() {
     };
   }, [sessionCode, supabase]);
 
-  // Customer scan simulation:
+  // Customer scan simulation (auto):
   // When receipt token is ready and toggle requests auto scan, broadcast CUSTOMER_SCANNED once per token.
   useEffect(() => {
     const ch = channelRef.current;
@@ -242,11 +306,15 @@ export default function CustomerDisplayPage() {
         token_id: tokenId,
       } satisfies JsonObject);
 
-      await ch.send({
-        type: "broadcast",
-        event: "pos_sim",
-        payload: ev,
-      });
+      try {
+        await ch.send({
+          type: "broadcast",
+          event: "pos_sim",
+          payload: ev,
+        });
+      } catch {
+        // Ignore; host will still be able to continue demo via manual scan buttons.
+      }
     }, 1200);
   }, [
     snapshot?.receipt?.token_id,
@@ -255,6 +323,18 @@ export default function CustomerDisplayPage() {
     sessionId,
     snapshot,
   ]);
+
+  // Reset auto-scan “seen token” when a new sale starts / receipt cleared
+  useEffect(() => {
+    const tokenId = snapshot?.receipt?.token_id ?? null;
+    if (!tokenId) {
+      lastAutoScanTokenRef.current = null;
+      if (autoScanTimerRef.current) {
+        window.clearTimeout(autoScanTimerRef.current);
+        autoScanTimerRef.current = null;
+      }
+    }
+  }, [snapshot?.receipt?.token_id]);
 
   if (!POS_SIM_ENABLED) {
     return (
@@ -268,6 +348,10 @@ export default function CustomerDisplayPage() {
   }
 
   const receiptUrl = snapshot?.receipt?.public_url ?? null;
+  const scanState = snapshot?.scan?.state ?? "—";
+  const tokenId = snapshot?.receipt?.token_id ?? null;
+
+  const showScanControls = !!snapshot && !!receiptUrl && canSendScan();
 
   return (
     <div
@@ -356,9 +440,7 @@ export default function CustomerDisplayPage() {
                 <div style={{ marginTop: 10, fontSize: 12, opacity: 0.7 }}>
                   Scan
                 </div>
-                <div style={{ fontSize: 16, fontWeight: 700 }}>
-                  {snapshot.scan?.state ?? "—"}
-                </div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>{scanState}</div>
               </div>
 
               <div
@@ -380,6 +462,60 @@ export default function CustomerDisplayPage() {
                     ? "Scan the QR to receive your receipt."
                     : "Waiting for receipt issuance."}
                 </div>
+
+                {showScanControls && (
+                  <div style={{ marginTop: 12 }}>
+                    <div style={{ fontSize: 12, opacity: 0.75 }}>
+                      Demo control: simulate customer scan
+                    </div>
+                    <div
+                      style={{
+                        marginTop: 8,
+                        display: "flex",
+                        gap: 10,
+                        flexWrap: "wrap",
+                        alignItems: "center",
+                      }}
+                    >
+                      <button
+                        onClick={() => void sendScan("success")}
+                        style={{
+                          padding: "10px 12px",
+                          borderRadius: 10,
+                          border: "1px solid #0a7",
+                          background: "white",
+                          fontWeight: 800,
+                        }}
+                      >
+                        Simulate Scan Success
+                      </button>
+                      <button
+                        onClick={() => void sendScan("fail")}
+                        style={{
+                          padding: "10px 12px",
+                          borderRadius: 10,
+                          border: "1px solid #c33",
+                          background: "white",
+                          fontWeight: 800,
+                        }}
+                      >
+                        Simulate Scan Fail
+                      </button>
+                      {scanSendStatus ? (
+                        <span style={{ fontSize: 12, opacity: 0.8 }}>
+                          {scanSendStatus}
+                        </span>
+                      ) : null}
+                    </div>
+
+                    <div style={{ marginTop: 8, fontSize: 12, opacity: 0.75 }}>
+                      Token:{" "}
+                      <span style={{ fontFamily: "monospace" }}>
+                        {tokenId ?? "—"}
+                      </span>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
 
