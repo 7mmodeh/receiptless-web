@@ -121,3 +121,23 @@ export type BroadcastMessage = {
   event: string;
   payload: unknown;
 };
+
+// --- Receipt issuance request body (matches /api/pos-sim/issue-receipt exactly) ---
+export type IssueReceiptBody = {
+  retailer_id: string;
+  store_id: string;
+  terminal_code: string;
+
+  issued_at: string; // ISO
+  receipt_number?: string | null;
+
+  currency: string;
+  subtotal: number;
+  vat_total: number;
+  total: number;
+
+  items: CartItem[];
+};
+
+
+export type IssueReceiptResponse = unknown;
