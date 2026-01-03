@@ -200,12 +200,13 @@ export default function WebPosSimPageA4() {
 
     setTimelineWriteStatus("ok");
 
-    if (data) {
-      setTimeline((prev) => {
-        if (prev.some((e) => e.id === (data as any).id)) return prev;
-        return [...prev, data as unknown as PosSimDbEvent];
-      });
-    }
+    const inserted = data as unknown as PosSimDbEvent | null;
+    if (!inserted) return;
+
+    setTimeline((prev) => {
+      if (prev.some((e) => e.id === inserted.id)) return prev;
+      return [...prev, inserted];
+    });
   }
 
   async function loadTimelineAndSubscribe(sessionId: string) {
