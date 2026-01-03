@@ -53,6 +53,12 @@ export type ReceiptInfo = {
 
 export type ScanState = "NONE" | "PENDING" | "SUCCESS" | "FAIL";
 
+/**
+ * Proper recursive JSON types (no undefined).
+ */
+export type JsonValue = string | number | boolean | null | JsonObject | JsonValue[];
+export type JsonObject = { [key: string]: JsonValue };
+
 export type PosSimSnapshot = {
   session_id: string | null;
   session_code: string;
@@ -99,18 +105,6 @@ export type PosSimEventType =
   | "CART_UPDATED"
   | "SNAPSHOT_SYNC"
   | "RESET_REQUESTED";
-
-export type JsonValue =
-  | string
-  | number
-  | boolean
-  | null
-  | { [key: string]: JsonValueLeaf }
-  | JsonValueLeaf[];
-
-type JsonValueLeaf = string | number | boolean | null;
-
-export type JsonObject = Record<string, JsonValue>;
 
 export type PosSimEvent = {
   type: PosSimEventType;
