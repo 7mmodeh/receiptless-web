@@ -1,14 +1,18 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
-import type {
-  IssueReceiptBody,
-  IssueReceiptResponse,
-  PosSimSnapshot,
-} from "@/lib/posSimTypes";
+import Image, { ImageLoader } from "next/image";
+import type { IssueReceiptBody, PosSimSnapshot } from "@/lib/posSimTypes";
 
 type SnapshotApiOk = { ok: true; snapshot: PosSimSnapshot; updated_at: string };
 type SnapshotApiErr = { ok: false; error: string; details?: unknown };
+
+type IssueReceiptResponseStrict = {
+  token_id: string;
+  public_url: string;
+  qr_url: string;
+  preview_url: string | null;
+};
 
 function formatIso(ts: string) {
   const d = new Date(ts);
@@ -99,6 +103,39 @@ function buildIssueReceiptBody(snapshot: PosSimSnapshot): IssueReceiptBody {
   };
 }
 
+function makeQrImgUrl(dataUrl: string) {
+  return `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(
+    dataUrl
+  )}`;
+}
+
+/**
+ * next/image requires either:
+ *  - remotePatterns/domains in next.config.js, OR
+ *  - a custom loader.
+ *
+ * We use a local loader here so you don't need next.config changes.
+ * We also set unoptimized on the QR because it's a dynamic external PNG.
+ */
+const qrLoader: ImageLoader = ({ src }) => src;
+
+async function copyToClipboard(text: string) {
+  if (typeof navigator === "undefined") return;
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  // Fallback
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.left = "-9999px";
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand("copy");
+  document.body.removeChild(ta);
+}
+
 export function PosPaymentOutcomeSimulator(props: { sessionId: string }) {
   const { sessionId } = props;
 
@@ -109,11 +146,12 @@ export function PosPaymentOutcomeSimulator(props: { sessionId: string }) {
   const [snapshotBusy, setSnapshotBusy] = useState<boolean>(false);
 
   const [issueBusy, setIssueBusy] = useState<boolean>(false);
-  const [issueResult, setIssueResult] = useState<IssueReceiptResponse | null>(
-    null
-  );
+  const [issueResult, setIssueResult] =
+    useState<IssueReceiptResponseStrict | null>(null);
 
   const [error, setError] = useState<string | null>(null);
+
+  const [copied, setCopied] = useState<string | null>(null);
 
   const canLoad = Boolean(sessionId);
   const canIssue = Boolean(
@@ -133,6 +171,9 @@ export function PosPaymentOutcomeSimulator(props: { sessionId: string }) {
       total: c?.total,
     };
   }, [snapshot]);
+
+  const receiptUrl = issueResult?.public_url ?? null;
+  const qrImgUrl = receiptUrl ? makeQrImgUrl(receiptUrl) : null;
 
   async function loadSnapshot() {
     if (!sessionId) return;
@@ -180,18 +221,40 @@ export function PosPaymentOutcomeSimulator(props: { sessionId: string }) {
 
       const body = buildIssueReceiptBody(snapshot);
 
-      const resp = await postJson<IssueReceiptResponse>(
+      const resp = await postJson<IssueReceiptResponseStrict>(
         `/api/pos-sim/issue-receipt`,
         body
       );
 
+      // Minimal runtime validation (no guessing)
+      if (
+        !resp ||
+        typeof resp !== "object" ||
+        typeof resp.token_id !== "string" ||
+        typeof resp.public_url !== "string" ||
+        typeof resp.qr_url !== "string" ||
+        !("preview_url" in resp)
+      ) {
+        throw new Error("Unexpected issue-receipt response shape.");
+      }
+
       setIssueResult(resp);
-      //   // eslint-disable-next-line no-console
+      // // eslint-disable-next-line no-console
       console.log("issue-receipt response:", resp);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Receipt issuance failed");
     } finally {
       setIssueBusy(false);
+    }
+  }
+
+  async function doCopy(label: string, value: string) {
+    try {
+      await copyToClipboard(value);
+      setCopied(label);
+      window.setTimeout(() => setCopied(null), 1200);
+    } catch {
+      setCopied(null);
     }
   }
 
@@ -201,6 +264,7 @@ export function PosPaymentOutcomeSimulator(props: { sessionId: string }) {
     setSnapshotUpdatedAt(null);
     setIssueResult(null);
     setError(null);
+    setCopied(null);
   }, [sessionId]);
 
   return (
@@ -314,18 +378,106 @@ export function PosPaymentOutcomeSimulator(props: { sessionId: string }) {
           </div>
 
           <div className="text-xs text-gray-600">
-            Requires a loaded snapshot (terminal + cart). If the call fails,
-            paste the raw response shown below.
+            Requires a loaded snapshot (terminal + cart). On success, you’ll get
+            a token + public URL to show the receipt.
           </div>
 
           {issueResult ? (
-            <div className="rounded-lg border bg-white p-3">
-              <div className="text-xs text-gray-600 mb-2">
-                Raw response (paste this back to me)
+            <div className="space-y-3">
+              {/* QR + Actions */}
+              <div className="rounded-xl border bg-gray-50 p-3">
+                <div className="text-sm font-semibold">Receipt Ready</div>
+
+                <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-[240px_1fr]">
+                  <div className="rounded-lg border bg-white p-2">
+                    <div className="text-xs text-gray-600 mb-2">Receipt QR</div>
+
+                    {qrImgUrl ? (
+                      <Image
+                        loader={qrLoader}
+                        src={qrImgUrl}
+                        alt="Receipt QR"
+                        width={240}
+                        height={240}
+                        unoptimized
+                        className="block h-[240px] w-[240px]"
+                      />
+                    ) : (
+                      <div className="h-[240px] w-[240px] rounded bg-gray-100" />
+                    )}
+
+                    <div className="mt-2 text-[11px] text-gray-500 break-all">
+                      Encoded: {receiptUrl}
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="text-xs text-gray-600">Token</div>
+                    <div className="rounded-lg border bg-white p-2 font-mono text-xs break-all">
+                      {issueResult.token_id}
+                    </div>
+
+                    <div className="text-xs text-gray-600">Public URL</div>
+                    <div className="rounded-lg border bg-white p-2 font-mono text-xs break-all">
+                      {issueResult.public_url}
+                    </div>
+
+                    <div className="flex flex-wrap gap-2 pt-1">
+                      <button
+                        type="button"
+                        className="rounded-lg border px-3 py-1.5 text-sm hover:bg-white"
+                        onClick={() => doCopy("token", issueResult.token_id)}
+                      >
+                        {copied === "token" ? "Copied" : "Copy Token"}
+                      </button>
+
+                      <button
+                        type="button"
+                        className="rounded-lg border px-3 py-1.5 text-sm hover:bg-white"
+                        onClick={() => doCopy("url", issueResult.public_url)}
+                      >
+                        {copied === "url" ? "Copied" : "Copy URL"}
+                      </button>
+
+                      <a
+                        className="rounded-lg bg-black px-3 py-1.5 text-sm text-white hover:opacity-95"
+                        href={issueResult.public_url}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Open Receipt
+                      </a>
+                    </div>
+
+                    {issueResult.preview_url ? (
+                      <div className="pt-2">
+                        <div className="text-xs text-gray-600 mb-1">
+                          Preview
+                        </div>
+                        <iframe
+                          title="Receipt preview"
+                          src={issueResult.preview_url}
+                          className="h-[260px] w-full rounded-lg border bg-white"
+                        />
+                      </div>
+                    ) : (
+                      <div className="pt-2 text-xs text-gray-500">
+                        preview_url is null (expected in your current response).
+                      </div>
+                    )}
+                  </div>
+                </div>
               </div>
-              <pre className="whitespace-pre-wrap break-words rounded-lg bg-gray-50 p-2 text-xs">
-                {compactJson(issueResult)}
-              </pre>
+
+              {/* Raw response */}
+              <div className="rounded-lg border bg-white p-3">
+                <div className="text-xs text-gray-600 mb-2">
+                  Raw response (paste this back to me if needed)
+                </div>
+                <pre className="whitespace-pre-wrap break-words rounded-lg bg-gray-50 p-2 text-xs">
+                  {compactJson(issueResult)}
+                </pre>
+              </div>
             </div>
           ) : (
             <div className="rounded-lg border bg-gray-50 p-4 text-sm text-gray-700">
