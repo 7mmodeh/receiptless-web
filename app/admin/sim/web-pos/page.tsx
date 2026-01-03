@@ -142,7 +142,333 @@ function normalizeDbEventRow(v: unknown): PosSimDbEvent | null {
   return r as unknown as PosSimDbEvent;
 }
 
-export default function WebPosSimPageA4() {
+/**
+ * ============
+ * A5 helpers
+ * ============
+ * Keep types non-recursive (avoid TS2456) and avoid explicit `any`.
+ */
+type JsonRecord = Record<string, unknown>;
+
+function asJsonRecord(v: unknown): JsonRecord | null {
+  if (!v || typeof v !== "object") return null;
+  if (Array.isArray(v)) return null;
+  return v as JsonRecord;
+}
+
+function getString(rec: JsonRecord, key: string): string | null {
+  const v = rec[key];
+  return typeof v === "string" ? v : null;
+}
+
+function getNumber(rec: JsonRecord, key: string): number | null {
+  const v = rec[key];
+  if (typeof v !== "number") return null;
+  return Number.isFinite(v) ? v : null;
+}
+
+type TimelineFilterKey =
+  | "sale_only"
+  | "errors_only"
+  | "customer_actions"
+  | "receipt_token"
+  | "fallback_prints";
+
+type TimelineFilters = Record<TimelineFilterKey, boolean>;
+
+const DEFAULT_FILTERS: TimelineFilters = {
+  sale_only: false,
+  errors_only: false,
+  customer_actions: false,
+  receipt_token: false,
+  fallback_prints: false,
+};
+
+function isErrorEventType(event_type: string) {
+  return (
+    event_type.includes("FAILED") ||
+    event_type.includes("ERROR") ||
+    event_type === "PAYMENT_RESULT"
+  );
+}
+
+function isCustomerActionEventType(event_type: string) {
+  return event_type === "CUSTOMER_JOINED" || event_type === "CUSTOMER_SCANNED";
+}
+
+function isReceiptTokenEventType(event_type: string) {
+  return (
+    event_type.includes("RECEIPT") ||
+    event_type.includes("TOKEN") ||
+    event_type === "PAYMENT_PROCESSING" ||
+    event_type === "PAYMENT_RESULT"
+  );
+}
+
+function isFallbackPrintEventType(event_type: string) {
+  return event_type === "FALLBACK_PRINTED";
+}
+
+function getEventMeta(event_type: string): {
+  label: string;
+  icon: string;
+  category:
+    | "session"
+    | "sale"
+    | "payment"
+    | "receipt"
+    | "customer"
+    | "fallback"
+    | "toggle"
+    | "system";
+} {
+  switch (event_type) {
+    case "SESSION_CREATED":
+      return { label: "Session created", icon: "●", category: "session" };
+    case "NEW_SALE_STARTED":
+      return { label: "New sale", icon: "🧾", category: "sale" };
+    case "CART_UPDATED":
+      return { label: "Cart updated", icon: "🛒", category: "sale" };
+    case "CART_CLEARED":
+      return { label: "Cart cleared", icon: "🧹", category: "sale" };
+    case "CHECKOUT_INITIATED":
+      return { label: "Checkout initiated", icon: "➡", category: "sale" };
+    case "PAYMENT_PROCESSING":
+      return { label: "Payment processing", icon: "⌛", category: "payment" };
+    case "PAYMENT_RESULT":
+      return { label: "Payment result", icon: "💳", category: "payment" };
+    case "RECEIPT_ISSUANCE_STARTED":
+      return { label: "Issuing receipt", icon: "🧩", category: "receipt" };
+    case "RECEIPT_TOKEN_READY":
+      return { label: "Receipt token ready", icon: "✅", category: "receipt" };
+    case "RECEIPT_ISSUANCE_FAILED":
+      return {
+        label: "Receipt issuance failed",
+        icon: "⚠",
+        category: "receipt",
+      };
+    case "CUSTOMER_JOINED":
+      return { label: "Customer joined", icon: "👤", category: "customer" };
+    case "CUSTOMER_SCANNED":
+      return { label: "Customer scanned", icon: "📷", category: "customer" };
+    case "FALLBACK_PRINTED":
+      return { label: "Fallback print", icon: "🖨", category: "fallback" };
+    case "TOGGLE_UPDATED":
+      return { label: "Toggle changed", icon: "⚙", category: "toggle" };
+    case "STAGE_CHANGED":
+      return { label: "Stage changed", icon: "↔", category: "sale" };
+    case "RESET_REQUESTED":
+      return { label: "Reset requested", icon: "↺", category: "system" };
+    default:
+      return { label: event_type, icon: "•", category: "system" };
+  }
+}
+
+function pickPayloadSummary(event_type: string, payload: unknown): string {
+  const p = asJsonRecord(payload) ?? {};
+  const saleId = getString(p, "sale_id");
+
+  switch (event_type) {
+    case "SESSION_CREATED": {
+      const code = getString(p, "session_code");
+      const mode = getString(p, "mode");
+      return [code ? `code=${code}` : null, mode ? `mode=${mode}` : null]
+        .filter(Boolean)
+        .join(" · ");
+    }
+
+    case "NEW_SALE_STARTED":
+      return saleId ? `sale=${saleId}` : "sale=—";
+
+    case "CART_UPDATED": {
+      const itemsCount = getNumber(p, "items_count");
+      const totalN = getNumber(p, "total");
+      return [
+        itemsCount !== null ? `items=${itemsCount}` : null,
+        totalN !== null ? `total=EUR ${totalN.toFixed(2)}` : null,
+        saleId ? `sale=${saleId}` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+    }
+
+    case "CHECKOUT_INITIATED": {
+      const totalN = getNumber(p, "total");
+      const currency = getString(p, "currency");
+      return [
+        totalN !== null
+          ? `total=${currency ?? "EUR"} ${totalN.toFixed(2)}`
+          : null,
+        saleId ? `sale=${saleId}` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+    }
+
+    case "PAYMENT_PROCESSING": {
+      const totalN = getNumber(p, "total");
+      const currency = getString(p, "currency");
+      return [
+        "processing",
+        totalN !== null
+          ? `amt=${currency ?? "EUR"} ${totalN.toFixed(2)}`
+          : null,
+        saleId ? `sale=${saleId}` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+    }
+
+    case "PAYMENT_RESULT": {
+      const state = getString(p, "state") ?? "—";
+      return [state, saleId ? `sale=${saleId}` : null]
+        .filter(Boolean)
+        .join(" · ");
+    }
+
+    case "RECEIPT_ISSUANCE_STARTED":
+      return [saleId ? `sale=${saleId}` : null].filter(Boolean).join(" · ");
+
+    case "RECEIPT_TOKEN_READY": {
+      const tokenId = getString(p, "token_id");
+      const publicUrl = getString(p, "public_url");
+      return [
+        tokenId ? `token=${tokenId}` : null,
+        publicUrl ? "url=ready" : null,
+        saleId ? `sale=${saleId}` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+    }
+
+    case "RECEIPT_ISSUANCE_FAILED": {
+      const msg = getString(p, "message");
+      return [
+        "failed",
+        msg ? `msg=${msg.slice(0, 60)}` : null,
+        saleId ? `sale=${saleId}` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+    }
+
+    case "CUSTOMER_JOINED": {
+      const code = getString(p, "session_code");
+      return [code ? `code=${code}` : null, saleId ? `sale=${saleId}` : null]
+        .filter(Boolean)
+        .join(" · ");
+    }
+
+    case "CUSTOMER_SCANNED": {
+      const outcome = getString(p, "outcome");
+      const tokenId = getString(p, "token_id");
+      return [
+        outcome ? `outcome=${outcome}` : null,
+        tokenId ? `token=${tokenId}` : null,
+        saleId ? `sale=${saleId}` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+    }
+
+    case "FALLBACK_PRINTED": {
+      const reason = getString(p, "reason");
+      return [
+        reason ? `reason=${reason}` : null,
+        saleId ? `sale=${saleId}` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+    }
+
+    case "TOGGLE_UPDATED": {
+      const toggle = getString(p, "toggle");
+      const val = getString(p, "value");
+      return [
+        toggle ? `toggle=${toggle}` : null,
+        val ? `value=${val}` : null,
+        saleId ? `sale=${saleId}` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+    }
+
+    default:
+      return saleId ? `sale=${saleId}` : shortJson(payload);
+  }
+}
+
+function eventMatchesFilters(
+  e: PosSimDbEvent,
+  filters: TimelineFilters,
+  activeSaleId: string | null
+): boolean {
+  const et = e.event_type;
+
+  if (filters.sale_only) {
+    const p = asJsonRecord(e.payload) ?? {};
+    const saleId = getString(p, "sale_id");
+    if (!saleId) return false;
+  }
+
+  if (filters.errors_only) {
+    if (!isErrorEventType(et)) return false;
+    if (et === "PAYMENT_RESULT") {
+      const p = asJsonRecord(e.payload) ?? {};
+      const state = getString(p, "state");
+      const isBad =
+        state === "DECLINED" ||
+        state === "TIMEOUT" ||
+        state === "NETWORK_ERROR";
+      if (!isBad) return false;
+    }
+  }
+
+  if (filters.customer_actions && !isCustomerActionEventType(et)) return false;
+  if (filters.receipt_token && !isReceiptTokenEventType(et)) return false;
+  if (filters.fallback_prints && !isFallbackPrintEventType(et)) return false;
+
+  if (filters.sale_only && activeSaleId) {
+    const p = asJsonRecord(e.payload) ?? {};
+    const saleId = getString(p, "sale_id");
+    if (saleId && saleId !== activeSaleId) return false;
+  }
+
+  return true;
+}
+
+function groupBySaleId(events: PosSimDbEvent[]): Array<{
+  sale_id: string | null;
+  events: PosSimDbEvent[];
+}> {
+  const map = new Map<string, PosSimDbEvent[]>();
+  const NO_SALE = "__no_sale__";
+
+  for (const e of events) {
+    const p = asJsonRecord(e.payload) ?? {};
+    const saleId = getString(p, "sale_id");
+    const key = saleId ?? NO_SALE;
+    const arr = map.get(key) ?? [];
+    arr.push(e);
+    map.set(key, arr);
+  }
+
+  const out: Array<{ sale_id: string | null; events: PosSimDbEvent[] }> = [];
+  for (const [k, arr] of map.entries()) {
+    arr.sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
+    out.push({ sale_id: k === NO_SALE ? null : k, events: arr });
+  }
+
+  out.sort((a, b) => {
+    const aLast = a.events[a.events.length - 1]?.created_at ?? "";
+    const bLast = b.events[b.events.length - 1]?.created_at ?? "";
+    return aLast < bLast ? 1 : -1;
+  });
+
+  return out;
+}
+
+export default function WebPosSimPageA5() {
   const supabase = useMemo(() => getSupabaseClient(), []);
 
   const [creating, setCreating] = useState(false);
@@ -153,6 +479,16 @@ export default function WebPosSimPageA4() {
     customer_url: string;
     snapshot: PosSimSnapshot;
   } | null>(null);
+
+  // A5: filters + expandable events + grouping
+  const [filters, setFilters] = useState<TimelineFilters>(DEFAULT_FILTERS);
+  const [expandedEventIds, setExpandedEventIds] = useState<
+    Record<string, boolean>
+  >({});
+  const [guidedOpen, setGuidedOpen] = useState<boolean>(true);
+  const [timelineCollapsedSales, setTimelineCollapsedSales] = useState<
+    Record<string, boolean>
+  >({});
 
   // Durable timeline
   const [timeline, setTimeline] = useState<PosSimDbEvent[]>([]);
@@ -174,6 +510,13 @@ export default function WebPosSimPageA4() {
 
   function getSnap(): PosSimSnapshot | null {
     return snapshotRef.current ?? session?.snapshot ?? null;
+  }
+
+  function withSale(snap: PosSimSnapshot, payload: JsonObject): JsonObject {
+    return {
+      sale_id: snap.active_sale_id ?? null,
+      ...payload,
+    } as unknown as JsonObject;
   }
 
   useEffect(() => {
@@ -231,7 +574,6 @@ export default function WebPosSimPageA4() {
   }
 
   async function loadTimelineAndSubscribe(sessionId: string) {
-    // Load history via RPC
     const { data, error } = await supabase.rpc("pos_sim_get_events", {
       p_session_id: sessionId,
       p_limit: 400,
@@ -247,7 +589,6 @@ export default function WebPosSimPageA4() {
       setTimelineWriteStatus("read ok");
     }
 
-    // Subscribe to INSERTs (optional; requires publication + realtime enabled)
     if (timelineChRef.current) {
       supabase.removeChannel(timelineChRef.current);
       timelineChRef.current = null;
@@ -282,7 +623,7 @@ export default function WebPosSimPageA4() {
   }
 
   // ==========================
-  // Canonical snapshot: pos_sim_sessions.snapshot_json
+  // Canonical snapshot
   // ==========================
   async function persistSnapshot(nextSnap: PosSimSnapshot) {
     const sid = sessionIdRef.current;
@@ -313,12 +654,13 @@ export default function WebPosSimPageA4() {
   ) {
     await persistSnapshot(nextSnap);
     if (event_type) {
-      await logDbEvent(event_type, event_payload ?? ({} as JsonObject));
+      const enriched = withSale(nextSnap, event_payload ?? ({} as JsonObject));
+      await logDbEvent(event_type, enriched);
     }
   }
 
   // ==========================
-  // Paper receipt fallback
+  // Fallback print
   // ==========================
   function canAutoFallbackPrint(snap: PosSimSnapshot) {
     return (
@@ -334,8 +676,6 @@ export default function WebPosSimPageA4() {
     const snap = getSnap();
     if (!snap) return;
 
-    // Rule #1: button/manual print after payment approved
-    // Rule #2: auto fallback on scan fail / issuance fail after approved
     if (!canAutoFallbackPrint(snap)) {
       setHostStatus(
         "Print not allowed (toggle disabled / not approved / already printed)"
@@ -352,7 +692,6 @@ export default function WebPosSimPageA4() {
     setHostStatus(`Printed paper receipt (${reason})`);
     await persistAndBroadcast(nextSnap, "FALLBACK_PRINTED", {
       reason,
-      sale_id: nextSnap.active_sale_id ?? null,
     } as unknown as JsonObject);
   }
 
@@ -423,9 +762,12 @@ export default function WebPosSimPageA4() {
             const snap = snapshotRef.current;
             if (!sid || !snap) return;
 
-            await logDbEvent("CUSTOMER_JOINED", {
-              session_code,
-            } as unknown as JsonObject);
+            await logDbEvent(
+              "CUSTOMER_JOINED",
+              withSale(snap, {
+                session_code,
+              } as unknown as JsonObject)
+            );
 
             const snapEv = makeEvent(
               "SNAPSHOT_SYNC",
@@ -470,7 +812,6 @@ export default function WebPosSimPageA4() {
               token_id: snap.receipt?.token_id ?? null,
             } as unknown as JsonObject);
 
-            // Rule #2: payment success + scan fail => fallback print
             if (outcome === "FAIL" && canAutoFallbackPrint(nextSnap)) {
               await fallbackPrint("SCAN_FAIL");
             }
@@ -712,6 +1053,37 @@ export default function WebPosSimPageA4() {
     } as unknown as JsonObject);
   }
 
+  function resetSession() {
+    const snap = getSnap();
+    if (!snap) return;
+
+    issuingRef.current = false;
+
+    if (payTimerRef.current) {
+      window.clearTimeout(payTimerRef.current);
+      payTimerRef.current = null;
+    }
+
+    const nextSnap: PosSimSnapshot = {
+      ...snap,
+      active_sale_id: null,
+      flow: { stage: "CART", payment_state: "IDLE", issuance_state: "IDLE" },
+      receipt: null,
+      scan: { state: "NONE" },
+      fallback: { printed: false, print_reason: null },
+      cart: {
+        currency: snap.cart.currency ?? "EUR",
+        items: [],
+        subtotal: 0,
+        vat_total: 0,
+        total: 0,
+      },
+    };
+
+    setHostStatus("Reset session");
+    void persistAndBroadcast(nextSnap, "RESET_REQUESTED", {} as JsonObject);
+  }
+
   function newSale() {
     const snap = getSnap();
     if (!snap) return;
@@ -779,7 +1151,6 @@ export default function WebPosSimPageA4() {
         state: "NETWORK_ERROR",
       } as unknown as JsonObject);
 
-      // NOTE: payment not approved => no fallback print
       return;
     }
 
@@ -905,7 +1276,10 @@ export default function WebPosSimPageA4() {
       > | null;
 
       if (!res.ok) {
-        const details = out?.details ?? out ?? { status: res.status };
+        const details = (out as JsonRecord | null)?.details ??
+          out ?? {
+            status: res.status,
+          };
         throw new Error(
           typeof details === "string" ? details : JSON.stringify(details)
         );
@@ -955,7 +1329,6 @@ export default function WebPosSimPageA4() {
         message: msg,
       } as unknown as JsonObject);
 
-      // Rule #2: payment success + issuance fail => fallback print
       if (canAutoFallbackPrint(failedSnap)) {
         await fallbackPrint("ISSUANCE_FAIL");
       }
@@ -964,7 +1337,6 @@ export default function WebPosSimPageA4() {
     }
   }
 
-  // Auto-issue receipt once when payment is approved
   useEffect(() => {
     const snap = getSnap();
     if (!snap) return;
@@ -984,6 +1356,82 @@ export default function WebPosSimPageA4() {
     session?.snapshot?.flow?.payment_state,
     session?.snapshot?.flow?.issuance_state,
   ]);
+
+  // ==========================
+  // A5 guided demo macros
+  // ==========================
+  async function runMacro(name: string) {
+    const snap = getSnap();
+    if (!snap) return;
+
+    try {
+      if (name === "happy_path") {
+        updateToggle("network_mode", "normal");
+        updateToggle("payment_outcome", "success");
+        updateToggle("print_fallback", "enabled");
+        updateToggle("customer_scan_sim", "auto_success");
+
+        if (cartIsEmpty(snap)) {
+          addItem(CATALOG[0]!);
+          addItem(CATALOG[1]!);
+        }
+
+        goToCheckout();
+        pay();
+        return;
+      }
+
+      if (name === "issuance_fail_fallback") {
+        updateToggle("network_mode", "normal");
+        updateToggle("payment_outcome", "success");
+        updateToggle("print_fallback", "enabled");
+
+        if (cartIsEmpty(snap)) {
+          addItem(CATALOG[2]!);
+          addItem(CATALOG[3]!);
+        }
+
+        goToCheckout();
+        pay();
+        return;
+      }
+
+      if (name === "scan_fail_fallback") {
+        updateToggle("network_mode", "normal");
+        updateToggle("payment_outcome", "success");
+        updateToggle("print_fallback", "enabled");
+        updateToggle("customer_scan_sim", "auto_fail");
+
+        if (cartIsEmpty(snap)) {
+          addItem(CATALOG[1]!);
+          addItem(CATALOG[3]!);
+        }
+
+        goToCheckout();
+        pay();
+        return;
+      }
+
+      if (name === "network_down_pay") {
+        updateToggle("network_mode", "down");
+        updateToggle("payment_outcome", "success");
+        updateToggle("print_fallback", "enabled");
+        updateToggle("customer_scan_sim", "none");
+
+        if (cartIsEmpty(snap)) {
+          addItem(CATALOG[0]!);
+          addItem(CATALOG[2]!);
+        }
+
+        goToCheckout();
+        pay();
+        return;
+      }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setHostStatus(`Macro failed: ${name} — ${msg}`);
+    }
+  }
 
   if (!POS_SIM_ENABLED) {
     return (
@@ -1008,15 +1456,54 @@ export default function WebPosSimPageA4() {
     snap.toggles.print_fallback === "enabled" &&
     !snap.fallback.printed;
 
+  const latest = snap
+    ? {
+        sale_id: snap.active_sale_id ?? "—",
+        stage: snap.flow.stage,
+        payment: snap.flow.payment_state,
+        issuance: snap.flow.issuance_state,
+        scan: snap.scan?.state ?? "—",
+        token: snap.receipt?.token_id ?? "—",
+        fallback: snap.fallback.printed
+          ? `PRINTED (${snap.fallback.print_reason ?? "—"})`
+          : "not printed",
+      }
+    : null;
+
+  const activeSaleId = snap?.active_sale_id ?? null;
+  const filteredTimeline = timeline.filter((e) =>
+    eventMatchesFilters(e, filters, activeSaleId)
+  );
+  const grouped = groupBySaleId(filteredTimeline);
+
+  function toggleFilter(k: TimelineFilterKey) {
+    setFilters((prev) => ({ ...prev, [k]: !prev[k] }));
+  }
+
+  function toggleExpandEvent(id: string) {
+    setExpandedEventIds((prev) => ({ ...prev, [id]: !prev[id] }));
+  }
+
+  function toggleSaleCollapse(saleIdKey: string) {
+    setTimelineCollapsedSales((prev) => ({
+      ...prev,
+      [saleIdKey]: !prev[saleIdKey],
+    }));
+  }
+
+  function saleKey(sale_id: string | null) {
+    return sale_id ?? "__no_sale__";
+  }
+
   return (
-    <div style={{ padding: 24, maxWidth: 1240 }}>
+    <div style={{ padding: 24, maxWidth: 1320 }}>
       <h1 style={{ fontSize: 22, fontWeight: 800 }}>
-        Receiptless POS Simulator — Web POS (A4)
+        Receiptless POS Simulator — Web POS (A5)
       </h1>
       <p style={{ marginTop: 8 }}>
         Canonical: <b>pos_sim_sessions.snapshot_json</b>. Durable timeline:{" "}
         <b>pos_sim_events</b> (via SECURITY DEFINER RPC). Broadcast stays for
-        instant sync.
+        instant sync. SNAPSHOT_SYNC is the only realtime UI driver.
       </p>
 
       <div style={{ marginTop: 10, fontSize: 13, opacity: 0.85 }}>
@@ -1047,624 +1534,1014 @@ export default function WebPosSimPageA4() {
           </div>
         </div>
       ) : (
-        <div
-          style={{
-            marginTop: 18,
-            display: "flex",
-            gap: 16,
-            flexWrap: "wrap",
-          }}
-        >
-          {/* Left column */}
-          <div
-            style={{
-              flex: 1,
-              minWidth: 360,
-              border: "1px solid #ddd",
-              borderRadius: 12,
-              padding: 14,
-            }}
-          >
+        <>
+          {latest && (
             <div
               style={{
-                display: "flex",
-                justifyContent: "space-between",
-                gap: 12,
+                position: "sticky",
+                top: 0,
+                zIndex: 30,
+                marginTop: 14,
+                padding: 12,
+                borderRadius: 12,
+                border: "1px solid #ddd",
+                background: "white",
               }}
             >
-              <div>
-                <div style={{ fontSize: 12, opacity: 0.7 }}>Session Code</div>
-                <div
-                  style={{ fontSize: 26, fontWeight: 900, letterSpacing: 2 }}
-                >
-                  {session.session_code}
-                </div>
+              <div style={{ fontSize: 12, opacity: 0.7 }}>
+                Latest state (canonical snapshot)
               </div>
-              <div style={{ textAlign: "right" }}>
-                <div style={{ fontSize: 12, opacity: 0.7 }}>Stage</div>
-                <div style={{ fontWeight: 900 }}>{stage}</div>
-                <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
-                  Payment
-                </div>
-                <div style={{ fontWeight: 900 }}>{payState}</div>
-                <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
-                  Issuance
-                </div>
-                <div style={{ fontWeight: 900 }}>{issuanceState}</div>
-                <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
-                  Scan
-                </div>
-                <div style={{ fontWeight: 900 }}>{scanState}</div>
-              </div>
-            </div>
-
-            <div style={{ marginTop: 10, fontSize: 12, opacity: 0.7 }}>
-              Customer Display
-            </div>
-            <a href={session.customer_url} target="_blank" rel="noreferrer">
-              Open Customer Display
-            </a>
-
-            <div style={{ marginTop: 10, fontSize: 12, opacity: 0.7 }}>
-              Full URL
-            </div>
-            <div
-              style={{
-                fontFamily: "monospace",
-                fontSize: 12,
-                wordBreak: "break-all",
-              }}
-            >
-              {customerFullUrl}
-            </div>
-
-            <hr style={{ margin: "14px 0" }} />
-
-            <div style={{ fontSize: 14, fontWeight: 900, marginBottom: 8 }}>
-              Demo Toggles
-            </div>
-
-            <div style={{ display: "grid", gap: 10 }}>
-              <label style={{ display: "grid", gap: 6 }}>
-                <div style={{ fontSize: 12, opacity: 0.8 }}>
-                  Payment Outcome
-                </div>
-                <select
-                  value={snap?.toggles.payment_outcome ?? "success"}
-                  onChange={(e) =>
-                    updateToggle(
-                      "payment_outcome",
-                      e.target.value as "success" | "fail" | "timeout"
-                    )
-                  }
-                  style={{
-                    padding: 10,
-                    borderRadius: 10,
-                    border: "1px solid #ccc",
-                  }}
-                >
-                  <option value="success">Success</option>
-                  <option value="fail">Fail</option>
-                  <option value="timeout">Timeout</option>
-                </select>
-              </label>
-
-              <label style={{ display: "grid", gap: 6 }}>
-                <div style={{ fontSize: 12, opacity: 0.8 }}>Network Mode</div>
-                <select
-                  value={snap?.toggles.network_mode ?? "normal"}
-                  onChange={(e) =>
-                    updateToggle(
-                      "network_mode",
-                      e.target.value as "normal" | "slow" | "down"
-                    )
-                  }
-                  style={{
-                    padding: 10,
-                    borderRadius: 10,
-                    border: "1px solid #ccc",
-                  }}
-                >
-                  <option value="normal">Normal</option>
-                  <option value="slow">Slow</option>
-                  <option value="down">Down</option>
-                </select>
-              </label>
-
-              <label style={{ display: "grid", gap: 6 }}>
-                <div style={{ fontSize: 12, opacity: 0.8 }}>Print Fallback</div>
-                <select
-                  value={snap?.toggles.print_fallback ?? "enabled"}
-                  onChange={(e) =>
-                    updateToggle(
-                      "print_fallback",
-                      e.target.value as "enabled" | "disabled"
-                    )
-                  }
-                  style={{
-                    padding: 10,
-                    borderRadius: 10,
-                    border: "1px solid #ccc",
-                  }}
-                >
-                  <option value="enabled">Enabled</option>
-                  <option value="disabled">Disabled</option>
-                </select>
-              </label>
-
-              <label style={{ display: "grid", gap: 6 }}>
-                <div style={{ fontSize: 12, opacity: 0.8 }}>
-                  Customer Scan Sim
-                </div>
-                <select
-                  value={snap?.toggles.customer_scan_sim ?? "none"}
-                  onChange={(e) =>
-                    updateToggle(
-                      "customer_scan_sim",
-                      e.target.value as "none" | "auto_success" | "auto_fail"
-                    )
-                  }
-                  style={{
-                    padding: 10,
-                    borderRadius: 10,
-                    border: "1px solid #ccc",
-                  }}
-                >
-                  <option value="none">None</option>
-                  <option value="auto_success">Auto Success</option>
-                  <option value="auto_fail">Auto Fail</option>
-                </select>
-              </label>
-            </div>
-
-            <hr style={{ margin: "14px 0" }} />
-
-            <div style={{ fontSize: 14, fontWeight: 900, marginBottom: 8 }}>
-              Demo Catalog
-            </div>
-            <div style={{ display: "grid", gap: 8 }}>
-              {CATALOG.map((ci) => (
-                <button
-                  key={ci.sku}
-                  onClick={() => addItem(ci)}
-                  disabled={stage === "PROCESSING"}
-                  style={{
-                    textAlign: "left",
-                    padding: "10px 12px",
-                    borderRadius: 10,
-                    border: "1px solid #ccc",
-                    background: "white",
-                    opacity: stage === "PROCESSING" ? 0.6 : 1,
-                  }}
-                >
-                  <div style={{ fontWeight: 800 }}>{ci.name}</div>
-                  <div style={{ fontSize: 12, opacity: 0.8 }}>
-                    {ci.sku} — EUR {ci.price.toFixed(2)} — VAT{" "}
-                    {(ci.vat_rate * 100).toFixed(0)}%
-                  </div>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Right column */}
-          <div
-            style={{
-              flex: 1.5,
-              minWidth: 560,
-              border: "1px solid #ddd",
-              borderRadius: 12,
-              padding: 14,
-            }}
-          >
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                gap: 10,
-                alignItems: "baseline",
-              }}
-            >
-              <div style={{ fontSize: 14, fontWeight: 900 }}>Cart</div>
               <div
                 style={{
                   display: "flex",
-                  gap: 8,
+                  gap: 14,
                   flexWrap: "wrap",
-                  justifyContent: "flex-end",
+                  marginTop: 6,
+                  fontSize: 13,
                 }}
               >
+                <div>
+                  <b>sale</b>:{" "}
+                  <span style={{ fontFamily: "monospace" }}>
+                    {latest.sale_id}
+                  </span>
+                </div>
+                <div>
+                  <b>stage</b>: {latest.stage}
+                </div>
+                <div>
+                  <b>payment</b>: {latest.payment}
+                </div>
+                <div>
+                  <b>issuance</b>: {latest.issuance}
+                </div>
+                <div>
+                  <b>scan</b>: {latest.scan}
+                </div>
+                <div>
+                  <b>token</b>:{" "}
+                  <span style={{ fontFamily: "monospace" }}>
+                    {latest.token}
+                  </span>
+                </div>
+                <div>
+                  <b>fallback</b>: {latest.fallback}
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div
+            style={{
+              marginTop: 18,
+              display: "flex",
+              gap: 16,
+              flexWrap: "wrap",
+              alignItems: "flex-start",
+            }}
+          >
+            {/* Left column */}
+            <div
+              style={{
+                flex: 1,
+                minWidth: 360,
+                border: "1px solid #ddd",
+                borderRadius: 12,
+                padding: 14,
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: 12,
+                }}
+              >
+                <div>
+                  <div style={{ fontSize: 12, opacity: 0.7 }}>Session Code</div>
+                  <div
+                    style={{ fontSize: 26, fontWeight: 900, letterSpacing: 2 }}
+                  >
+                    {session.session_code}
+                  </div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 12, opacity: 0.7 }}>Stage</div>
+                  <div style={{ fontWeight: 900 }}>{stage}</div>
+                  <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
+                    Payment
+                  </div>
+                  <div style={{ fontWeight: 900 }}>{payState}</div>
+                  <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
+                    Issuance
+                  </div>
+                  <div style={{ fontWeight: 900 }}>{issuanceState}</div>
+                  <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
+                    Scan
+                  </div>
+                  <div style={{ fontWeight: 900 }}>{scanState}</div>
+                </div>
+              </div>
+
+              <div style={{ marginTop: 10, fontSize: 12, opacity: 0.7 }}>
+                Customer Display
+              </div>
+              <a href={session.customer_url} target="_blank" rel="noreferrer">
+                Open Customer Display
+              </a>
+
+              <div style={{ marginTop: 10, fontSize: 12, opacity: 0.7 }}>
+                Full URL
+              </div>
+              <div
+                style={{
+                  fontFamily: "monospace",
+                  fontSize: 12,
+                  wordBreak: "break-all",
+                }}
+              >
+                {customerFullUrl}
+              </div>
+
+              <hr style={{ margin: "14px 0" }} />
+
+              {/* Guided demo controls */}
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <div style={{ fontSize: 14, fontWeight: 900 }}>
+                  Guided Demo Controls
+                </div>
                 <button
-                  onClick={newSale}
+                  onClick={() => setGuidedOpen((v) => !v)}
                   style={{
                     border: "1px solid #ccc",
                     borderRadius: 10,
-                    padding: "8px 10px",
+                    padding: "6px 10px",
                     background: "white",
                     fontWeight: 800,
                   }}
                 >
-                  New Sale
+                  {guidedOpen ? "Hide" : "Show"}
                 </button>
-                <button
-                  onClick={clearCart}
-                  disabled={stage === "PROCESSING"}
-                  style={{
-                    border: "1px solid #ccc",
-                    borderRadius: 10,
-                    padding: "8px 10px",
-                    background: "white",
-                    opacity: stage === "PROCESSING" ? 0.6 : 1,
-                  }}
-                >
-                  Clear
-                </button>
+              </div>
+
+              {guidedOpen && (
+                <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
+                  <button
+                    onClick={() => void runMacro("happy_path")}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid #111",
+                      background: "#111",
+                      color: "white",
+                      fontWeight: 900,
+                      textAlign: "left",
+                    }}
+                  >
+                    Happy path
+                    <div style={{ fontSize: 12, opacity: 0.85, marginTop: 4 }}>
+                      Auto-success scan; normal network; payment success.
+                    </div>
+                  </button>
+
+                  <button
+                    onClick={() => void runMacro("issuance_fail_fallback")}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid #ccc",
+                      background: "white",
+                      fontWeight: 900,
+                      textAlign: "left",
+                    }}
+                  >
+                    Issuance fail → fallback print
+                    <div style={{ fontSize: 12, opacity: 0.75, marginTop: 4 }}>
+                      Payment success; issuance failure triggers fallback (if
+                      enabled).
+                    </div>
+                  </button>
+
+                  <button
+                    onClick={() => void runMacro("scan_fail_fallback")}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid #ccc",
+                      background: "white",
+                      fontWeight: 900,
+                      textAlign: "left",
+                    }}
+                  >
+                    Scan fail → fallback print
+                    <div style={{ fontSize: 12, opacity: 0.75, marginTop: 4 }}>
+                      Auto-fail scan; fallback triggers when enabled.
+                    </div>
+                  </button>
+
+                  <button
+                    onClick={() => void runMacro("network_down_pay")}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid #ccc",
+                      background: "white",
+                      fontWeight: 900,
+                      textAlign: "left",
+                    }}
+                  >
+                    Network down at pay
+                    <div style={{ fontSize: 12, opacity: 0.75, marginTop: 4 }}>
+                      network_mode=down → PAYMENT_RESULT=NETWORK_ERROR.
+                    </div>
+                  </button>
+
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <button
+                      onClick={newSale}
+                      style={{
+                        border: "1px solid #ccc",
+                        borderRadius: 10,
+                        padding: "8px 10px",
+                        background: "white",
+                        fontWeight: 900,
+                      }}
+                    >
+                      New Sale
+                    </button>
+                    <button
+                      onClick={resetSession}
+                      style={{
+                        border: "1px solid #ccc",
+                        borderRadius: 10,
+                        padding: "8px 10px",
+                        background: "white",
+                        fontWeight: 900,
+                      }}
+                    >
+                      Reset
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <hr style={{ margin: "14px 0" }} />
+
+              <div style={{ fontSize: 14, fontWeight: 900, marginBottom: 8 }}>
+                Demo Toggles
+              </div>
+
+              <div style={{ display: "grid", gap: 10 }}>
+                <label style={{ display: "grid", gap: 6 }}>
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>
+                    Payment Outcome
+                  </div>
+                  <select
+                    value={snap?.toggles.payment_outcome ?? "success"}
+                    onChange={(e) =>
+                      updateToggle(
+                        "payment_outcome",
+                        e.target.value as "success" | "fail" | "timeout"
+                      )
+                    }
+                    style={{
+                      padding: 10,
+                      borderRadius: 10,
+                      border: "1px solid #ccc",
+                    }}
+                  >
+                    <option value="success">Success</option>
+                    <option value="fail">Fail</option>
+                    <option value="timeout">Timeout</option>
+                  </select>
+                </label>
+
+                <label style={{ display: "grid", gap: 6 }}>
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>Network Mode</div>
+                  <select
+                    value={snap?.toggles.network_mode ?? "normal"}
+                    onChange={(e) =>
+                      updateToggle(
+                        "network_mode",
+                        e.target.value as "normal" | "slow" | "down"
+                      )
+                    }
+                    style={{
+                      padding: 10,
+                      borderRadius: 10,
+                      border: "1px solid #ccc",
+                    }}
+                  >
+                    <option value="normal">Normal</option>
+                    <option value="slow">Slow</option>
+                    <option value="down">Down</option>
+                  </select>
+                </label>
+
+                <label style={{ display: "grid", gap: 6 }}>
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>
+                    Print Fallback
+                  </div>
+                  <select
+                    value={snap?.toggles.print_fallback ?? "enabled"}
+                    onChange={(e) =>
+                      updateToggle(
+                        "print_fallback",
+                        e.target.value as "enabled" | "disabled"
+                      )
+                    }
+                    style={{
+                      padding: 10,
+                      borderRadius: 10,
+                      border: "1px solid #ccc",
+                    }}
+                  >
+                    <option value="enabled">Enabled</option>
+                    <option value="disabled">Disabled</option>
+                  </select>
+                </label>
+
+                <label style={{ display: "grid", gap: 6 }}>
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>
+                    Customer Scan Sim
+                  </div>
+                  <select
+                    value={snap?.toggles.customer_scan_sim ?? "none"}
+                    onChange={(e) =>
+                      updateToggle(
+                        "customer_scan_sim",
+                        e.target.value as "none" | "auto_success" | "auto_fail"
+                      )
+                    }
+                    style={{
+                      padding: 10,
+                      borderRadius: 10,
+                      border: "1px solid #ccc",
+                    }}
+                  >
+                    <option value="none">None</option>
+                    <option value="auto_success">Auto Success</option>
+                    <option value="auto_fail">Auto Fail</option>
+                  </select>
+                </label>
+              </div>
+
+              <hr style={{ margin: "14px 0" }} />
+
+              <div style={{ fontSize: 14, fontWeight: 900, marginBottom: 8 }}>
+                Demo Catalog
+              </div>
+              <div style={{ display: "grid", gap: 8 }}>
+                {CATALOG.map((ci) => (
+                  <button
+                    key={ci.sku}
+                    onClick={() => addItem(ci)}
+                    disabled={stage === "PROCESSING"}
+                    style={{
+                      textAlign: "left",
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid #ccc",
+                      background: "white",
+                      opacity: stage === "PROCESSING" ? 0.6 : 1,
+                    }}
+                  >
+                    <div style={{ fontWeight: 800 }}>{ci.name}</div>
+                    <div style={{ fontSize: 12, opacity: 0.8 }}>
+                      {ci.sku} — EUR {ci.price.toFixed(2)} — VAT{" "}
+                      {(ci.vat_rate * 100).toFixed(0)}%
+                    </div>
+                  </button>
+                ))}
               </div>
             </div>
 
+            {/* Right column (Cart + Receipt) — uses decItem/incItem/clearCart/backToCart/showPrintButton */}
             <div
               style={{
-                marginTop: 12,
-                display: "flex",
-                gap: 10,
-                flexWrap: "wrap",
+                flex: 1.5,
+                minWidth: 560,
+                border: "1px solid #ddd",
+                borderRadius: 12,
+                padding: 14,
               }}
             >
-              <button
-                onClick={backToCart}
-                disabled={stage === "PROCESSING" || stage === "CART"}
+              <div
                 style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #ccc",
-                  background: "white",
-                  fontWeight: 800,
-                  opacity: stage === "PROCESSING" || stage === "CART" ? 0.6 : 1,
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: 10,
+                  alignItems: "baseline",
                 }}
               >
-                Back to Cart
-              </button>
+                <div style={{ fontSize: 14, fontWeight: 900 }}>Cart</div>
+                <div
+                  style={{
+                    display: "flex",
+                    gap: 8,
+                    flexWrap: "wrap",
+                    justifyContent: "flex-end",
+                  }}
+                >
+                  <button
+                    onClick={newSale}
+                    style={{
+                      border: "1px solid #ccc",
+                      borderRadius: 10,
+                      padding: "8px 10px",
+                      background: "white",
+                      fontWeight: 800,
+                    }}
+                  >
+                    New Sale
+                  </button>
+                  <button
+                    onClick={clearCart}
+                    disabled={stage === "PROCESSING"}
+                    style={{
+                      border: "1px solid #ccc",
+                      borderRadius: 10,
+                      padding: "8px 10px",
+                      background: "white",
+                      opacity: stage === "PROCESSING" ? 0.6 : 1,
+                    }}
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
 
-              <button
-                onClick={goToCheckout}
-                disabled={!snap || cartIsEmpty(snap) || stage === "PROCESSING"}
+              <div
                 style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #ccc",
-                  background: "white",
-                  fontWeight: 900,
-                  opacity:
+                  marginTop: 12,
+                  display: "flex",
+                  gap: 10,
+                  flexWrap: "wrap",
+                }}
+              >
+                <button
+                  onClick={backToCart}
+                  disabled={stage === "PROCESSING" || stage === "CART"}
+                  style={{
+                    padding: "10px 12px",
+                    borderRadius: 10,
+                    border: "1px solid #ccc",
+                    background: "white",
+                    fontWeight: 800,
+                    opacity:
+                      stage === "PROCESSING" || stage === "CART" ? 0.6 : 1,
+                  }}
+                >
+                  Back to Cart
+                </button>
+
+                <button
+                  onClick={goToCheckout}
+                  disabled={
                     !snap || cartIsEmpty(snap) || stage === "PROCESSING"
-                      ? 0.6
-                      : 1,
-                }}
-              >
-                Checkout
-              </button>
+                  }
+                  style={{
+                    padding: "10px 12px",
+                    borderRadius: 10,
+                    border: "1px solid #ccc",
+                    background: "white",
+                    fontWeight: 900,
+                    opacity:
+                      !snap || cartIsEmpty(snap) || stage === "PROCESSING"
+                        ? 0.6
+                        : 1,
+                  }}
+                >
+                  Checkout
+                </button>
 
-              <button
-                onClick={pay}
-                disabled={!snap || cartIsEmpty(snap) || stage === "PROCESSING"}
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #111",
-                  background: "#111",
-                  color: "white",
-                  fontWeight: 900,
-                  opacity:
+                <button
+                  onClick={pay}
+                  disabled={
                     !snap || cartIsEmpty(snap) || stage === "PROCESSING"
-                      ? 0.6
-                      : 1,
-                }}
-              >
-                Pay
-              </button>
+                  }
+                  style={{
+                    padding: "10px 12px",
+                    borderRadius: 10,
+                    border: "1px solid #111",
+                    background: "#111",
+                    color: "white",
+                    fontWeight: 900,
+                    opacity:
+                      !snap || cartIsEmpty(snap) || stage === "PROCESSING"
+                        ? 0.6
+                        : 1,
+                  }}
+                >
+                  Pay
+                </button>
 
-              <button
-                onClick={issueReceipt}
-                disabled={
-                  !snap ||
-                  payState !== "APPROVED" ||
-                  issuanceState === "INGESTING" ||
-                  issuanceState === "TOKEN_READY"
-                }
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #0a7",
-                  background: "white",
-                  fontWeight: 900,
-                  opacity:
+                <button
+                  onClick={issueReceipt}
+                  disabled={
                     !snap ||
                     payState !== "APPROVED" ||
                     issuanceState === "INGESTING" ||
                     issuanceState === "TOKEN_READY"
-                      ? 0.6
-                      : 1,
-                }}
-              >
-                {issuanceState === "INGESTING"
-                  ? "Issuing..."
-                  : "Issue Receipt (Real)"}
-              </button>
+                  }
+                  style={{
+                    padding: "10px 12px",
+                    borderRadius: 10,
+                    border: "1px solid #0a7",
+                    background: "white",
+                    fontWeight: 900,
+                    opacity:
+                      !snap ||
+                      payState !== "APPROVED" ||
+                      issuanceState === "INGESTING" ||
+                      issuanceState === "TOKEN_READY"
+                        ? 0.6
+                        : 1,
+                  }}
+                >
+                  {issuanceState === "INGESTING"
+                    ? "Issuing..."
+                    : "Issue Receipt (Real)"}
+                </button>
 
-              {/* Rule #1: print button after pay success */}
-              <button
-                onClick={() => void fallbackPrint("CUSTOMER_REQUEST")}
-                disabled={!showPrintButton}
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #555",
-                  background: "white",
-                  fontWeight: 900,
-                  opacity: showPrintButton ? 1 : 0.6,
-                }}
-                title="Print paper receipt on POS terminal (simulated)"
-              >
-                Print Paper Receipt
-              </button>
-            </div>
-
-            <div style={{ marginTop: 14 }}>
-              {(session.snapshot.cart.items ?? []).length === 0 ? (
-                <div style={{ fontSize: 13, opacity: 0.8 }}>Cart is empty.</div>
-              ) : (
-                <div style={{ display: "grid", gap: 8 }}>
-                  {(session.snapshot.cart.items ?? []).map((it) => (
-                    <div
-                      key={it.line_no}
-                      style={{
-                        border: "1px solid #eee",
-                        borderRadius: 10,
-                        padding: 10,
-                        display: "flex",
-                        justifyContent: "space-between",
-                        gap: 10,
-                        alignItems: "center",
-                      }}
-                    >
-                      <div style={{ flex: 1 }}>
-                        <div style={{ fontWeight: 800 }}>{it.name}</div>
-                        <div style={{ fontSize: 12, opacity: 0.8 }}>
-                          {it.sku ?? "—"} — EUR{" "}
-                          {Number(it.unit_price).toFixed(2)}
-                        </div>
-                      </div>
-
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 8,
-                        }}
-                      >
-                        <button
-                          onClick={() => decItem(it.line_no)}
-                          disabled={stage === "PROCESSING"}
-                          style={{
-                            width: 34,
-                            height: 34,
-                            borderRadius: 10,
-                            border: "1px solid #ccc",
-                            background: "white",
-                            opacity: stage === "PROCESSING" ? 0.6 : 1,
-                          }}
-                        >
-                          −
-                        </button>
-                        <div
-                          style={{
-                            minWidth: 28,
-                            textAlign: "center",
-                            fontWeight: 900,
-                          }}
-                        >
-                          {it.qty}
-                        </div>
-                        <button
-                          onClick={() => incItem(it.line_no)}
-                          disabled={stage === "PROCESSING"}
-                          style={{
-                            width: 34,
-                            height: 34,
-                            borderRadius: 10,
-                            border: "1px solid #ccc",
-                            background: "white",
-                            opacity: stage === "PROCESSING" ? 0.6 : 1,
-                          }}
-                        >
-                          +
-                        </button>
-                      </div>
-
-                      <div style={{ fontFamily: "monospace", fontWeight: 900 }}>
-                        EUR {Number(it.line_total ?? 0).toFixed(2)}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            <div
-              style={{
-                marginTop: 14,
-                borderTop: "1px solid #eee",
-                paddingTop: 12,
-              }}
-            >
-              <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <div style={{ opacity: 0.8 }}>Subtotal</div>
-                <div style={{ fontWeight: 800 }}>
-                  EUR {Number(session.snapshot.cart.subtotal ?? 0).toFixed(2)}
-                </div>
+                <button
+                  onClick={() => void fallbackPrint("CUSTOMER_REQUEST")}
+                  disabled={!showPrintButton}
+                  style={{
+                    padding: "10px 12px",
+                    borderRadius: 10,
+                    border: "1px solid #555",
+                    background: "white",
+                    fontWeight: 900,
+                    opacity: showPrintButton ? 1 : 0.6,
+                  }}
+                  title="Print paper receipt on POS terminal (simulated)"
+                >
+                  Print Paper Receipt
+                </button>
               </div>
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  marginTop: 6,
-                }}
-              >
-                <div style={{ opacity: 0.8 }}>VAT</div>
-                <div style={{ fontWeight: 800 }}>
-                  EUR {Number(session.snapshot.cart.vat_total ?? 0).toFixed(2)}
-                </div>
-              </div>
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  marginTop: 10,
-                  fontSize: 18,
-                }}
-              >
-                <div style={{ fontWeight: 900 }}>Total</div>
-                <div style={{ fontWeight: 900 }}>
-                  EUR {Number(session.snapshot.cart.total ?? 0).toFixed(2)}
-                </div>
-              </div>
-            </div>
 
-            <div style={{ marginTop: 14 }}>
-              <div style={{ fontWeight: 900 }}>Receipt</div>
-
-              {/* Fallback state visibility */}
-              {snap?.fallback?.printed ? (
-                <div style={{ marginTop: 6, opacity: 0.9 }}>
-                  <b>Paper receipt printed</b> — reason:{" "}
-                  <b>{snap.fallback.print_reason ?? "—"}</b>
-                </div>
-              ) : (
-                <div style={{ marginTop: 6, opacity: 0.75 }}>
-                  Paper receipt not printed.
-                </div>
-              )}
-
-              {issuanceState === "IDLE" && (
-                <div style={{ opacity: 0.8, marginTop: 6 }}>
-                  Not issued yet.
-                </div>
-              )}
-              {issuanceState === "INGESTING" && (
-                <div style={{ opacity: 0.8, marginTop: 6 }}>
-                  Issuing receipt...
-                </div>
-              )}
-              {issuanceState === "FAILED" && (
-                <div style={{ opacity: 0.85, marginTop: 6 }}>
-                  Issuance failed. You can retry with{" "}
-                  <b>Issue Receipt (Real)</b>. Fallback print will auto-trigger
-                  if enabled.
-                </div>
-              )}
-              {issuanceState === "TOKEN_READY" && snap?.receipt && (
-                <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
-                  <div style={{ fontSize: 12, opacity: 0.8 }}>Public URL</div>
-                  <a
-                    href={snap.receipt.public_url}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    {snap.receipt.public_url}
-                  </a>
-                  <div style={{ fontSize: 12, opacity: 0.8 }}>Token</div>
-                  <div style={{ fontFamily: "monospace" }}>
-                    {snap.receipt.token_id}
+              <div style={{ marginTop: 14 }}>
+                {(session.snapshot.cart.items ?? []).length === 0 ? (
+                  <div style={{ fontSize: 13, opacity: 0.8 }}>
+                    Cart is empty.
                   </div>
-                </div>
-              )}
-            </div>
-
-            <div style={{ marginTop: 14, fontSize: 12, opacity: 0.7 }}>
-              Snapshot (debug)
-            </div>
-            <pre
-              style={{
-                marginTop: 6,
-                fontSize: 12,
-                maxHeight: 220,
-                overflow: "auto",
-              }}
-            >
-              {JSON.stringify(session.snapshot, null, 2)}
-            </pre>
-          </div>
-
-          {/* Timeline column */}
-          <div
-            style={{
-              flex: 0.9,
-              minWidth: 360,
-              border: "1px solid #ddd",
-              borderRadius: 12,
-              padding: 14,
-            }}
-          >
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                gap: 10,
-              }}
-            >
-              <div style={{ fontWeight: 900 }}>Lifecycle Timeline</div>
-              <div style={{ fontSize: 12, opacity: 0.7 }}>
-                {timeline.length} events
-              </div>
-            </div>
-
-            <div style={{ marginTop: 6, fontSize: 12, opacity: 0.75 }}>
-              Durable source:{" "}
-              <span style={{ fontFamily: "monospace" }}>
-                public.pos_sim_events
-              </span>
-            </div>
-
-            <div style={{ marginTop: 10, maxHeight: 760, overflow: "auto" }}>
-              {timeline.length === 0 ? (
-                <div style={{ fontSize: 13, opacity: 0.8 }}>
-                  No events yet. If Timeline status shows FAILED, the RPC is
-                  failing — copy that error.
-                </div>
-              ) : (
-                <div style={{ display: "grid", gap: 8 }}>
-                  {timeline.map((e) => (
-                    <div
-                      key={e.id}
-                      style={{
-                        border: "1px solid #eee",
-                        borderRadius: 10,
-                        padding: 10,
-                      }}
-                    >
+                ) : (
+                  <div style={{ display: "grid", gap: 8 }}>
+                    {(session.snapshot.cart.items ?? []).map((it) => (
                       <div
+                        key={it.line_no}
                         style={{
+                          border: "1px solid #eee",
+                          borderRadius: 10,
+                          padding: 10,
                           display: "flex",
                           justifyContent: "space-between",
                           gap: 10,
+                          alignItems: "center",
                         }}
                       >
-                        <div style={{ fontWeight: 900 }}>{e.event_type}</div>
-                        <div style={{ fontSize: 12, opacity: 0.7 }}>
-                          {fmtTime(e.created_at)}
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontWeight: 800 }}>{it.name}</div>
+                          <div style={{ fontSize: 12, opacity: 0.8 }}>
+                            {it.sku ?? "—"} — EUR{" "}
+                            {Number(it.unit_price).toFixed(2)}
+                          </div>
+                        </div>
+
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 8,
+                          }}
+                        >
+                          <button
+                            onClick={() => decItem(it.line_no)}
+                            disabled={stage === "PROCESSING"}
+                            style={{
+                              width: 34,
+                              height: 34,
+                              borderRadius: 10,
+                              border: "1px solid #ccc",
+                              background: "white",
+                              opacity: stage === "PROCESSING" ? 0.6 : 1,
+                            }}
+                          >
+                            −
+                          </button>
+                          <div
+                            style={{
+                              minWidth: 28,
+                              textAlign: "center",
+                              fontWeight: 900,
+                            }}
+                          >
+                            {it.qty}
+                          </div>
+                          <button
+                            onClick={() => incItem(it.line_no)}
+                            disabled={stage === "PROCESSING"}
+                            style={{
+                              width: 34,
+                              height: 34,
+                              borderRadius: 10,
+                              border: "1px solid #ccc",
+                              background: "white",
+                              opacity: stage === "PROCESSING" ? 0.6 : 1,
+                            }}
+                          >
+                            +
+                          </button>
+                        </div>
+
+                        <div
+                          style={{ fontFamily: "monospace", fontWeight: 900 }}
+                        >
+                          EUR {Number(it.line_total ?? 0).toFixed(2)}
                         </div>
                       </div>
-                      <div
-                        style={{ marginTop: 6, fontSize: 12, opacity: 0.85 }}
-                      >
-                        {shortJson(e.payload)}
-                      </div>
-                    </div>
-                  ))}
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div
+                style={{
+                  marginTop: 14,
+                  borderTop: "1px solid #eee",
+                  paddingTop: 12,
+                }}
+              >
+                <div
+                  style={{ display: "flex", justifyContent: "space-between" }}
+                >
+                  <div style={{ opacity: 0.8 }}>Subtotal</div>
+                  <div style={{ fontWeight: 800 }}>
+                    EUR {Number(session.snapshot.cart.subtotal ?? 0).toFixed(2)}
+                  </div>
                 </div>
-              )}
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    marginTop: 6,
+                  }}
+                >
+                  <div style={{ opacity: 0.8 }}>VAT</div>
+                  <div style={{ fontWeight: 800 }}>
+                    EUR{" "}
+                    {Number(session.snapshot.cart.vat_total ?? 0).toFixed(2)}
+                  </div>
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    marginTop: 10,
+                    fontSize: 18,
+                  }}
+                >
+                  <div style={{ fontWeight: 900 }}>Total</div>
+                  <div style={{ fontWeight: 900 }}>
+                    EUR {Number(session.snapshot.cart.total ?? 0).toFixed(2)}
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ marginTop: 14 }}>
+                <div style={{ fontWeight: 900 }}>Receipt</div>
+
+                {snap?.fallback?.printed ? (
+                  <div style={{ marginTop: 6, opacity: 0.9 }}>
+                    <b>Paper receipt printed</b> — reason:{" "}
+                    <b>{snap.fallback.print_reason ?? "—"}</b>
+                  </div>
+                ) : (
+                  <div style={{ marginTop: 6, opacity: 0.75 }}>
+                    Paper receipt not printed.
+                  </div>
+                )}
+
+                {issuanceState === "IDLE" && (
+                  <div style={{ opacity: 0.8, marginTop: 6 }}>
+                    Not issued yet.
+                  </div>
+                )}
+                {issuanceState === "INGESTING" && (
+                  <div style={{ opacity: 0.8, marginTop: 6 }}>
+                    Issuing receipt...
+                  </div>
+                )}
+                {issuanceState === "FAILED" && (
+                  <div style={{ opacity: 0.85, marginTop: 6 }}>
+                    Issuance failed. You can retry with{" "}
+                    <b>Issue Receipt (Real)</b>. Fallback print will
+                    auto-trigger if enabled.
+                  </div>
+                )}
+                {issuanceState === "TOKEN_READY" && snap?.receipt && (
+                  <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
+                    <div style={{ fontSize: 12, opacity: 0.8 }}>Public URL</div>
+                    <a
+                      href={snap.receipt.public_url}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {snap.receipt.public_url}
+                    </a>
+
+                    <div style={{ fontSize: 12, opacity: 0.8 }}>Token</div>
+                    <div style={{ fontFamily: "monospace" }}>
+                      {snap.receipt.token_id}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div style={{ marginTop: 14, fontSize: 12, opacity: 0.7 }}>
+                Snapshot (debug)
+              </div>
+              <pre
+                style={{
+                  marginTop: 6,
+                  fontSize: 12,
+                  maxHeight: 220,
+                  overflow: "auto",
+                }}
+              >
+                {JSON.stringify(session.snapshot, null, 2)}
+              </pre>
+            </div>
+
+            {/* Timeline column */}
+            <div
+              style={{
+                flex: 0.95,
+                minWidth: 380,
+                border: "1px solid #ddd",
+                borderRadius: 12,
+                padding: 14,
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: 10,
+                  alignItems: "baseline",
+                }}
+              >
+                <div style={{ fontWeight: 900 }}>Lifecycle Timeline</div>
+                <div style={{ fontSize: 12, opacity: 0.7 }}>
+                  {filteredTimeline.length} events
+                </div>
+              </div>
+
+              <div style={{ marginTop: 6, fontSize: 12, opacity: 0.75 }}>
+                Durable source:{" "}
+                <span style={{ fontFamily: "monospace" }}>
+                  public.pos_sim_events
+                </span>
+              </div>
+
+              <div
+                style={{
+                  marginTop: 10,
+                  padding: 10,
+                  border: "1px solid #eee",
+                  borderRadius: 12,
+                  display: "grid",
+                  gap: 8,
+                }}
+              >
+                <div style={{ fontWeight: 900, fontSize: 13 }}>Filters</div>
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  <label
+                    style={{ display: "flex", gap: 6, alignItems: "center" }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={filters.sale_only}
+                      onChange={() => toggleFilter("sale_only")}
+                    />
+                    <span style={{ fontSize: 13 }}>Sale only</span>
+                  </label>
+                  <label
+                    style={{ display: "flex", gap: 6, alignItems: "center" }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={filters.errors_only}
+                      onChange={() => toggleFilter("errors_only")}
+                    />
+                    <span style={{ fontSize: 13 }}>Errors only</span>
+                  </label>
+                  <label
+                    style={{ display: "flex", gap: 6, alignItems: "center" }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={filters.customer_actions}
+                      onChange={() => toggleFilter("customer_actions")}
+                    />
+                    <span style={{ fontSize: 13 }}>Customer actions</span>
+                  </label>
+                  <label
+                    style={{ display: "flex", gap: 6, alignItems: "center" }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={filters.receipt_token}
+                      onChange={() => toggleFilter("receipt_token")}
+                    />
+                    <span style={{ fontSize: 13 }}>Receipt/Token</span>
+                  </label>
+                  <label
+                    style={{ display: "flex", gap: 6, alignItems: "center" }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={filters.fallback_prints}
+                      onChange={() => toggleFilter("fallback_prints")}
+                    />
+                    <span style={{ fontSize: 13 }}>Fallback prints</span>
+                  </label>
+                </div>
+              </div>
+
+              <div style={{ marginTop: 10, maxHeight: 760, overflow: "auto" }}>
+                {filteredTimeline.length === 0 ? (
+                  <div style={{ fontSize: 13, opacity: 0.8 }}>
+                    No events yet (or filtered out).
+                  </div>
+                ) : (
+                  <div style={{ display: "grid", gap: 10 }}>
+                    {grouped.map((g) => {
+                      const key = saleKey(g.sale_id);
+                      const collapsed = !!timelineCollapsedSales[key];
+                      return (
+                        <div
+                          key={key}
+                          style={{
+                            border: "1px solid #eee",
+                            borderRadius: 12,
+                            padding: 10,
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              justifyContent: "space-between",
+                              gap: 10,
+                              alignItems: "baseline",
+                            }}
+                          >
+                            <div style={{ fontWeight: 900 }}>
+                              {g.sale_id ? (
+                                <>
+                                  Sale{" "}
+                                  <span style={{ fontFamily: "monospace" }}>
+                                    {g.sale_id}
+                                  </span>
+                                </>
+                              ) : (
+                                "Non-sale / session events"
+                              )}
+                            </div>
+                            <button
+                              onClick={() => toggleSaleCollapse(key)}
+                              style={{
+                                border: "1px solid #ccc",
+                                borderRadius: 10,
+                                padding: "6px 10px",
+                                background: "white",
+                                fontWeight: 800,
+                              }}
+                            >
+                              {collapsed ? "Expand" : "Collapse"}
+                            </button>
+                          </div>
+
+                          {!collapsed && (
+                            <div
+                              style={{ marginTop: 10, display: "grid", gap: 8 }}
+                            >
+                              {g.events.map((e) => {
+                                const meta = getEventMeta(e.event_type);
+                                const summary = pickPayloadSummary(
+                                  e.event_type,
+                                  e.payload
+                                );
+                                const expanded = !!expandedEventIds[e.id];
+
+                                return (
+                                  <div
+                                    key={e.id}
+                                    style={{
+                                      border: "1px solid #f0f0f0",
+                                      borderRadius: 10,
+                                      padding: 10,
+                                    }}
+                                  >
+                                    <div
+                                      style={{
+                                        display: "flex",
+                                        justifyContent: "space-between",
+                                        gap: 10,
+                                        alignItems: "baseline",
+                                      }}
+                                    >
+                                      <div
+                                        style={{
+                                          display: "flex",
+                                          gap: 8,
+                                          alignItems: "baseline",
+                                        }}
+                                      >
+                                        <div style={{ width: 18 }}>
+                                          {meta.icon}
+                                        </div>
+                                        <div style={{ fontWeight: 900 }}>
+                                          {meta.label}
+                                        </div>
+                                        <div
+                                          style={{ fontSize: 12, opacity: 0.7 }}
+                                        >
+                                          {e.event_type}
+                                        </div>
+                                      </div>
+                                      <div
+                                        style={{
+                                          display: "flex",
+                                          gap: 8,
+                                          alignItems: "center",
+                                        }}
+                                      >
+                                        <div
+                                          style={{ fontSize: 12, opacity: 0.7 }}
+                                        >
+                                          {fmtTime(e.created_at)}
+                                        </div>
+                                        <button
+                                          onClick={() =>
+                                            toggleExpandEvent(e.id)
+                                          }
+                                          style={{
+                                            border: "1px solid #ccc",
+                                            borderRadius: 10,
+                                            padding: "6px 10px",
+                                            background: "white",
+                                            fontWeight: 800,
+                                          }}
+                                        >
+                                          {expanded ? "Hide" : "Details"}
+                                        </button>
+                                      </div>
+                                    </div>
+
+                                    {summary ? (
+                                      <div
+                                        style={{
+                                          marginTop: 6,
+                                          fontSize: 12,
+                                          opacity: 0.85,
+                                        }}
+                                      >
+                                        {summary}
+                                      </div>
+                                    ) : null}
+
+                                    {expanded && (
+                                      <pre
+                                        style={{
+                                          marginTop: 8,
+                                          fontSize: 12,
+                                          maxHeight: 220,
+                                          overflow: "auto",
+                                          background: "#fafafa",
+                                          border: "1px solid #eee",
+                                          borderRadius: 10,
+                                          padding: 10,
+                                        }}
+                                      >
+                                        {JSON.stringify(e.payload, null, 2)}
+                                      </pre>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
-        </div>
+        </>
       )}
     </div>
   );
