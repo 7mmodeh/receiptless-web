@@ -1,4 +1,3 @@
-// app/api/pos-sim/issue-receipt/route.ts
 import { NextResponse } from "next/server";
 import crypto from "crypto";
 
@@ -17,18 +16,13 @@ type Body = {
   retailer_id: string;
   store_id: string;
   terminal_code: string;
-
-  // RL-011/RL-020/RL-030
   sale_id?: string;
-
   issued_at: string; // ISO
   receipt_number?: string | null;
-
   currency: string;
   subtotal: number;
   vat_total: number;
   total: number;
-
   items: ReceiptItemInput[];
 };
 
@@ -39,6 +33,12 @@ function isOn(v: string | undefined) {
 
 function bad(status: number, error: string, details?: unknown) {
   return NextResponse.json({ error, ...(details ? { details } : {}) }, { status });
+}
+
+function asNonEmptyString(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const t = v.trim();
+  return t.length ? t : null;
 }
 
 /* ---------------------------
@@ -58,10 +58,20 @@ function nonceB64url(bytes = 18) {
   return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
-function asNonEmptyString(v: unknown): string | null {
-  if (typeof v !== "string") return null;
-  const t = v.trim();
-  return t.length ? t : null;
+/**
+ * IMPORTANT:
+ * Supabase functions may be called via:
+ *  - https://<ref>.supabase.co/functions/v1/<name>
+ *  - https://<ref>.functions.supabase.co/<name>
+ * We must sign the ACTUAL pathname used by the URL we call.
+ */
+function buildSupabaseFunctionUrl(base: string, fnName: string) {
+  const b = base.replace(/\/+$/, "");
+  // If base host already is the functions domain, do NOT append /functions/v1
+  if (/\.functions\.supabase\.co$/i.test(new URL(b).hostname)) {
+    return `${b}/${fnName}`;
+  }
+  return `${b}/functions/v1/${fnName}`;
 }
 
 export async function POST(req: Request) {
@@ -70,11 +80,12 @@ export async function POST(req: Request) {
       isOn(process.env.POS_SIM_ENABLED) || isOn(process.env.NEXT_PUBLIC_POS_SIM_ENABLED);
     if (!enabled) return bad(404, "POS simulator not enabled");
 
-    const supabaseUrl = process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const supabaseBase =
+      process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL;
     const anonKey =
       process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? process.env.SUPABASE_ANON_KEY;
 
-    if (!supabaseUrl) return bad(500, "Missing SUPABASE_URL / NEXT_PUBLIC_SUPABASE_URL");
+    if (!supabaseBase) return bad(500, "Missing SUPABASE_URL / NEXT_PUBLIC_SUPABASE_URL");
     if (!anonKey) return bad(500, "Missing NEXT_PUBLIC_SUPABASE_ANON_KEY");
 
     const terminalKey = process.env.TERMINAL_KEY_TEST_001;
@@ -83,7 +94,7 @@ export async function POST(req: Request) {
     const RL_SECRET = process.env.RL_SIGNING_SECRET;
     if (!RL_SECRET) return bad(500, "Missing RL_SIGNING_SECRET in Vercel env");
 
-    const ingestUrl = `${supabaseUrl.replace(/\/+$/, "")}/functions/v1/receipt-ingest`;
+    const ingestUrl = buildSupabaseFunctionUrl(supabaseBase, "receipt-ingest");
 
     const bodyUnknown: unknown = await req.json().catch(() => null);
     if (!bodyUnknown || typeof bodyUnknown !== "object") {
@@ -105,7 +116,6 @@ export async function POST(req: Request) {
       return bad(400, "items must not be empty");
     }
 
-    // Ensure sale_id exists for idempotency
     const sale_id =
       asNonEmptyString(b.sale_id) ??
       asNonEmptyString(b.active_sale_id) ??
@@ -120,25 +130,26 @@ export async function POST(req: Request) {
       sale_id,
     };
 
+    // Sign EXACT bytes sent
     const rawBody = JSON.stringify(cleaned);
-
-    // RL-030 headers
     const ts = Date.now().toString();
     const nonce = nonceB64url();
     const bodyHash = sha256HexUtf8(rawBody);
 
+    // Sign the ACTUAL pathname of the URL being called
     const path = new URL(ingestUrl).pathname;
     const canonical = `RL1\nPOST\n${path}\n${ts}\n${nonce}\n${bodyHash}`;
     const sig = hmacB64url(RL_SECRET, canonical);
 
-    // DEBUG LOGS
-    console.log("RL DEBUG (Next) ingestUrl:", ingestUrl);
-    console.log("RL DEBUG (Next) pathname used:", new URL(ingestUrl).pathname);
-    console.log("RL DEBUG (Next) canonical string:\n", canonical);
-    console.log("RL DEBUG (Next) bodyHash:", bodyHash);
-    console.log("RL DEBUG (Next) sig:", sig);
-    console.log("RL DEBUG (Next) rawBody:", rawBody);
-    
+    // Optional: turn on debug with RL_DEBUG=1 (REMOVE after fix)
+    if (isOn(process.env.RL_DEBUG)) {
+      console.log("RL DEBUG issue-receipt ingestUrl:", ingestUrl);
+      console.log("RL DEBUG issue-receipt path:", path);
+      console.log("RL DEBUG issue-receipt canonical:\n", canonical);
+      console.log("RL DEBUG issue-receipt bodyHash:", bodyHash);
+      console.log("RL DEBUG issue-receipt sig:", sig);
+    }
+
     const res = await fetch(ingestUrl, {
       method: "POST",
       headers: {
@@ -146,10 +157,8 @@ export async function POST(req: Request) {
         apikey: anonKey,
         Authorization: `Bearer ${anonKey}`,
 
-        // terminal auth
         "x-terminal-key": terminalKey,
 
-        // RL-030 signature headers
         "x-rl-ts": ts,
         "x-rl-nonce": nonce,
         "x-rl-body-sha256": bodyHash,

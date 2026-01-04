@@ -1,4 +1,3 @@
-// app/api/pos-sim/consume-receipt/route.ts
 import { NextResponse } from "next/server";
 import crypto from "crypto";
 
@@ -48,6 +47,14 @@ function nonceB64url(bytes = 18) {
   return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
+function buildSupabaseFunctionUrl(base: string, fnName: string) {
+  const b = base.replace(/\/+$/, "");
+  if (/\.functions\.supabase\.co$/i.test(new URL(b).hostname)) {
+    return `${b}/${fnName}`;
+  }
+  return `${b}/functions/v1/${fnName}`;
+}
+
 export async function POST(req: Request) {
   try {
     const enabled =
@@ -55,13 +62,13 @@ export async function POST(req: Request) {
       isOn(process.env.NEXT_PUBLIC_POS_SIM_ENABLED);
     if (!enabled) return bad(404, "POS simulator not enabled");
 
-    const supabaseUrl =
+    const supabaseBase =
       process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL;
     const anonKey =
       process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ??
       process.env.SUPABASE_ANON_KEY;
 
-    if (!supabaseUrl)
+    if (!supabaseBase)
       return bad(500, "Missing SUPABASE_URL / NEXT_PUBLIC_SUPABASE_URL");
     if (!anonKey) return bad(500, "Missing NEXT_PUBLIC_SUPABASE_ANON_KEY");
 
@@ -72,10 +79,10 @@ export async function POST(req: Request) {
     const RL_SECRET = process.env.RL_SIGNING_SECRET;
     if (!RL_SECRET) return bad(500, "Missing RL_SIGNING_SECRET in Vercel env");
 
-    const consumeUrl = `${supabaseUrl.replace(
-      /\/+$/,
-      ""
-    )}/functions/v1/receipt-consume`;
+    const consumeUrl = buildSupabaseFunctionUrl(
+      supabaseBase,
+      "receipt-consume"
+    );
 
     const bodyUnknown: unknown = await req.json().catch(() => null);
     if (!bodyUnknown || typeof bodyUnknown !== "object") {
@@ -102,18 +109,22 @@ export async function POST(req: Request) {
       ...(retailer_id ? { retailer_id } : {}),
     };
 
-    // IMPORTANT: hash/sign the EXACT JSON you send
     const rawBody = JSON.stringify(cleaned);
-
-    // RL-030 headers
     const ts = Date.now().toString();
     const nonce = nonceB64url();
     const bodyHash = sha256HexUtf8(rawBody);
 
-    // MUST match the edge pathname exactly
     const path = new URL(consumeUrl).pathname;
     const canonical = `RL1\nPOST\n${path}\n${ts}\n${nonce}\n${bodyHash}`;
     const sig = hmacB64url(RL_SECRET, canonical);
+
+    if (isOn(process.env.RL_DEBUG)) {
+      console.log("RL DEBUG consume-receipt consumeUrl:", consumeUrl);
+      console.log("RL DEBUG consume-receipt path:", path);
+      console.log("RL DEBUG consume-receipt canonical:\n", canonical);
+      console.log("RL DEBUG consume-receipt bodyHash:", bodyHash);
+      console.log("RL DEBUG consume-receipt sig:", sig);
+    }
 
     const res = await fetch(consumeUrl, {
       method: "POST",
@@ -122,10 +133,8 @@ export async function POST(req: Request) {
         apikey: anonKey,
         Authorization: `Bearer ${anonKey}`,
 
-        // terminal verifier auth
         "x-verifier-key": terminalKey,
 
-        // RL-030 signature headers
         "x-rl-ts": ts,
         "x-rl-nonce": nonce,
         "x-rl-body-sha256": bodyHash,
