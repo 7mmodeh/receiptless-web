@@ -1,6 +1,6 @@
 // app/api/pos-sim/issue-receipt/route.ts
-
 import { NextResponse } from "next/server";
+import crypto from "crypto";
 
 type ReceiptItemInput = {
   line_no: number;
@@ -17,6 +17,9 @@ type Body = {
   retailer_id: string;
   store_id: string;
   terminal_code: string;
+
+  // RL-011/RL-020/RL-030
+  sale_id?: string;
 
   issued_at: string; // ISO
   receipt_number?: string | null;
@@ -38,50 +41,113 @@ function bad(status: number, error: string, details?: unknown) {
   return NextResponse.json({ error, ...(details ? { details } : {}) }, { status });
 }
 
+/* ---------------------------
+   RL-030 signing (Node)
+---------------------------- */
+function sha256HexUtf8(input: string) {
+  return crypto.createHash("sha256").update(input, "utf8").digest("hex");
+}
+
+function hmacB64url(secret: string, msg: string) {
+  const b64 = crypto.createHmac("sha256", secret).update(msg, "utf8").digest("base64");
+  return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function nonceB64url(bytes = 18) {
+  const b64 = crypto.randomBytes(bytes).toString("base64");
+  return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function asNonEmptyString(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const t = v.trim();
+  return t.length ? t : null;
+}
+
 export async function POST(req: Request) {
   try {
-    // Gate demo
     const enabled =
       isOn(process.env.POS_SIM_ENABLED) || isOn(process.env.NEXT_PUBLIC_POS_SIM_ENABLED);
     if (!enabled) return bad(404, "POS simulator not enabled");
 
-    // Required envs
-    const supabaseUrl =
-      process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const supabaseUrl = process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL;
     const anonKey =
       process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? process.env.SUPABASE_ANON_KEY;
 
     if (!supabaseUrl) return bad(500, "Missing SUPABASE_URL / NEXT_PUBLIC_SUPABASE_URL");
     if (!anonKey) return bad(500, "Missing NEXT_PUBLIC_SUPABASE_ANON_KEY");
 
-    // Your deployed secret in Vercel env
     const terminalKey = process.env.TERMINAL_KEY_TEST_001;
     if (!terminalKey) return bad(500, "Missing TERMINAL_KEY_TEST_001 in Vercel env");
 
+    const RL_SECRET = process.env.RL_SIGNING_SECRET;
+    if (!RL_SECRET) return bad(500, "Missing RL_SIGNING_SECRET in Vercel env");
+
     const ingestUrl = `${supabaseUrl.replace(/\/+$/, "")}/functions/v1/receipt-ingest`;
 
-    const body = (await req.json().catch(() => null)) as Body | null;
-    if (!body) return bad(400, "Invalid JSON body");
+    const bodyUnknown: unknown = await req.json().catch(() => null);
+    if (!bodyUnknown || typeof bodyUnknown !== "object") {
+      return bad(400, "Invalid JSON body");
+    }
 
-    // Minimal validation (the edge function validates strongly anyway)
-    if (!body.store_id || !body.terminal_code || !body.retailer_id) {
+    const b = bodyUnknown as Record<string, unknown>;
+
+    const retailer_id = asNonEmptyString(b.retailer_id);
+    const store_id = asNonEmptyString(b.store_id);
+    const terminal_code = asNonEmptyString(b.terminal_code);
+
+    if (!store_id || !terminal_code || !retailer_id) {
       return bad(400, "Missing store_id / terminal_code / retailer_id");
     }
-    if (!Array.isArray(body.items) || body.items.length === 0) {
+
+    const items = b.items;
+    if (!Array.isArray(items) || items.length === 0) {
       return bad(400, "items must not be empty");
     }
+
+    // Ensure sale_id exists for idempotency
+    const sale_id =
+      asNonEmptyString(b.sale_id) ??
+      asNonEmptyString(b.active_sale_id) ??
+      asNonEmptyString(b.session_id) ??
+      `SIM-${Date.now()}`;
+
+    const cleaned: Body = {
+      ...(b as Body),
+      retailer_id,
+      store_id,
+      terminal_code,
+      sale_id,
+    };
+
+    const rawBody = JSON.stringify(cleaned);
+
+    // RL-030 headers
+    const ts = Date.now().toString();
+    const nonce = nonceB64url();
+    const bodyHash = sha256HexUtf8(rawBody);
+
+    const path = "/functions/v1/receipt-ingest";
+    const canonical = `RL1\nPOST\n${path}\n${ts}\n${nonce}\n${bodyHash}`;
+    const sig = hmacB64url(RL_SECRET, canonical);
 
     const res = await fetch(ingestUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        // recommended for edge functions:
         apikey: anonKey,
         Authorization: `Bearer ${anonKey}`,
-        // terminal auth:
+
+        // terminal auth
         "x-terminal-key": terminalKey,
+
+        // RL-030 signature headers
+        "x-rl-ts": ts,
+        "x-rl-nonce": nonce,
+        "x-rl-body-sha256": bodyHash,
+        "x-rl-sig": sig,
       },
-      body: JSON.stringify(body),
+      body: rawBody,
     });
 
     const text = await res.text();
