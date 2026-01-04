@@ -111,7 +111,7 @@ export async function POST(req: Request) {
     const bodyHash = sha256HexUtf8(rawBody);
 
     // MUST match the edge pathname exactly
-    const path = "/functions/v1/receipt-consume";
+    const path = new URL(consumeUrl).pathname;
     const canonical = `RL1\nPOST\n${path}\n${ts}\n${nonce}\n${bodyHash}`;
     const sig = hmacB64url(RL_SECRET, canonical);
 

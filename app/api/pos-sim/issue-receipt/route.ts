@@ -127,7 +127,7 @@ export async function POST(req: Request) {
     const nonce = nonceB64url();
     const bodyHash = sha256HexUtf8(rawBody);
 
-    const path = "/functions/v1/receipt-ingest";
+    const path = new URL(ingestUrl).pathname;
     const canonical = `RL1\nPOST\n${path}\n${ts}\n${nonce}\n${bodyHash}`;
     const sig = hmacB64url(RL_SECRET, canonical);
 
