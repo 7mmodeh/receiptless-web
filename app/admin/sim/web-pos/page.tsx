@@ -34,6 +34,16 @@ type CatalogItem = {
   vat_rate: number; // 0.23 etc.
 };
 
+type ConsumeReceiptResponse = {
+  ok: boolean;
+  already_consumed?: boolean;
+  token_id?: string;
+  receipt_id?: string;
+  consumed_at?: string;
+  error?: string;
+  details?: unknown;
+};
+
 const CATALOG: CatalogItem[] = [
   { sku: "SKU-001", name: "Mineral Water 500ml", price: 1.2, vat_rate: 0.23 },
   { sku: "SKU-002", name: "Chicken Wrap", price: 4.5, vat_rate: 0.13 },
@@ -220,6 +230,9 @@ function eventLabel(event_type: string): { icon: string; label: string } {
     RECEIPT_TOKEN_READY: { icon: "▣", label: "Receipt token ready" },
     RECEIPT_ISSUANCE_FAILED: { icon: "!", label: "Receipt issuance failed" },
 
+    RECEIPT_CONSUMED_RETURN: { icon: "↩", label: "Receipt consumed (return)" },
+    RECEIPT_CONSUME_FAILED: { icon: "!", label: "Receipt consume failed" },
+
     CUSTOMER_JOINED: { icon: "👤", label: "Customer joined" }, // OK for clarity
     CUSTOMER_SCANNED: { icon: "⌁", label: "Customer scanned" },
 
@@ -324,6 +337,29 @@ function concisePayload(event_type: string, payload: JsonObject): string {
     return sid ? `sale=${sid.slice(0, 8)}` : safeJsonString(payload);
   }
 
+  if (event_type === "RECEIPT_CONSUMED_RETURN") {
+    const token_id = getString(p.token_id);
+    const already =
+      typeof p.already_consumed === "boolean" ? p.already_consumed : null;
+    const consumed_at = getString(p.consumed_at);
+    const parts = [
+      sale_id ? `sale=${sale_id.slice(0, 8)}` : null,
+      token_id ? `token=${token_id.slice(0, 8)}` : null,
+      already !== null ? `already=${already}` : null,
+      consumed_at ? `at=${fmtTime(consumed_at)}` : null,
+    ].filter(Boolean);
+    return parts.join(" · ") || safeJsonString(payload);
+  }
+
+  if (event_type === "RECEIPT_CONSUME_FAILED") {
+    const message = getString(p.message);
+    const parts = [
+      sale_id ? `sale=${sale_id.slice(0, 8)}` : null,
+      message ? `msg=${message}` : null,
+    ].filter(Boolean);
+    return parts.join(" · ") || safeJsonString(payload);
+  }
+
   return safeJsonString(payload);
 }
 
@@ -370,6 +406,9 @@ export default function WebPosSimPageA5() {
 
   const payTimerRef = useRef<number | null>(null);
   const issuingRef = useRef(false);
+
+  // Return consumption UI state
+  const [consumingReturn, setConsumingReturn] = useState(false);
 
   // Track whether we seeded the sale id at session start
   const seededSaleAtStartRef = useRef(false);
@@ -1272,6 +1311,74 @@ export default function WebPosSimPageA5() {
     }
   }
 
+  // Return consumption (RL-022)
+  async function consumeForReturn() {
+    const snap = getSnap();
+    if (!snap) return;
+
+    const tokenId = snap.receipt?.token_id ?? null;
+    if (!tokenId) {
+      setHostStatus("No token to consume (issue a receipt first)");
+      return;
+    }
+
+    if (consumingReturn) return;
+    setConsumingReturn(true);
+
+    try {
+      setHostStatus("Consuming receipt (return) ...");
+
+      const res = await fetch("/api/pos-sim/consume-receipt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          retailer_id: snap.terminal.retailer_id,
+          store_id: snap.terminal.store_id,
+          terminal_code: snap.terminal.terminal_code,
+          token_id: tokenId,
+          reason: "return_refund",
+        }),
+      });
+
+      const out = (await res
+        .json()
+        .catch(() => null)) as ConsumeReceiptResponse | null;
+
+      if (!res.ok) {
+        const details = out?.details ?? out ?? { status: res.status };
+        throw new Error(
+          typeof details === "string" ? details : JSON.stringify(details)
+        );
+      }
+
+      const already = Boolean(out?.already_consumed);
+      const consumed_at =
+        typeof out?.consumed_at === "string" ? out.consumed_at : null;
+
+      setHostStatus(
+        already
+          ? "Return: already consumed (idempotent)"
+          : "Return: consumed OK"
+      );
+
+      await logDbEvent("RECEIPT_CONSUMED_RETURN", {
+        sale_id: snap.active_sale_id ?? null,
+        token_id: tokenId,
+        already_consumed: already,
+        consumed_at,
+      } as unknown as JsonObject);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setHostStatus(`Return consume failed: ${msg}`);
+      await logDbEvent("RECEIPT_CONSUME_FAILED", {
+        sale_id: snap?.active_sale_id ?? null,
+        message: msg,
+      } as unknown as JsonObject);
+    } finally {
+      setConsumingReturn(false);
+    }
+  }
+
   // Auto-issue receipt once when payment is approved
   useEffect(() => {
     const snap = getSnap();
@@ -1561,6 +1668,11 @@ export default function WebPosSimPageA5() {
     snap.flow.payment_state === "APPROVED" &&
     snap.toggles.print_fallback === "enabled" &&
     !snap.fallback.printed;
+
+  const showConsumeReturnButton =
+    !!snap &&
+    !!snap.receipt?.token_id &&
+    snap.flow.payment_state === "APPROVED";
 
   return (
     <div style={{ padding: 24, maxWidth: 1320 }}>
@@ -2035,6 +2147,24 @@ export default function WebPosSimPageA5() {
                 title="Print paper receipt on POS terminal (simulated)"
               >
                 Print Paper Receipt
+              </button>
+
+              {/* RL-022: Consume (Return) */}
+              <button
+                onClick={() => void consumeForReturn()}
+                disabled={!showConsumeReturnButton || consumingReturn}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #b00",
+                  background: "white",
+                  fontWeight: 900,
+                  opacity:
+                    !showConsumeReturnButton || consumingReturn ? 0.6 : 1,
+                }}
+                title="Simulate return desk consumption of this receipt token"
+              >
+                {consumingReturn ? "Consuming..." : "Consume (Return)"}
               </button>
             </div>
 
