@@ -49,7 +49,10 @@ function sha256HexUtf8(input: string) {
 }
 
 function hmacB64url(secret: string, msg: string) {
-  const b64 = crypto.createHmac("sha256", secret).update(msg, "utf8").digest("base64");
+  const b64 = crypto
+    .createHmac("sha256", secret)
+    .update(msg, "utf8")
+    .digest("base64");
   return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
@@ -58,16 +61,8 @@ function nonceB64url(bytes = 18) {
   return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
-/**
- * IMPORTANT:
- * Supabase functions may be called via:
- *  - https://<ref>.supabase.co/functions/v1/<name>
- *  - https://<ref>.functions.supabase.co/<name>
- * We must sign the ACTUAL pathname used by the URL we call.
- */
 function buildSupabaseFunctionUrl(base: string, fnName: string) {
   const b = base.replace(/\/+$/, "");
-  // If base host already is the functions domain, do NOT append /functions/v1
   if (/\.functions\.supabase\.co$/i.test(new URL(b).hostname)) {
     return `${b}/${fnName}`;
   }
@@ -77,7 +72,8 @@ function buildSupabaseFunctionUrl(base: string, fnName: string) {
 export async function POST(req: Request) {
   try {
     const enabled =
-      isOn(process.env.POS_SIM_ENABLED) || isOn(process.env.NEXT_PUBLIC_POS_SIM_ENABLED);
+      isOn(process.env.POS_SIM_ENABLED) ||
+      isOn(process.env.NEXT_PUBLIC_POS_SIM_ENABLED);
     if (!enabled) return bad(404, "POS simulator not enabled");
 
     const supabaseBase =
@@ -85,16 +81,23 @@ export async function POST(req: Request) {
     const anonKey =
       process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? process.env.SUPABASE_ANON_KEY;
 
-    if (!supabaseBase) return bad(500, "Missing SUPABASE_URL / NEXT_PUBLIC_SUPABASE_URL");
-    if (!anonKey) return bad(500, "Missing NEXT_PUBLIC_SUPABASE_ANON_KEY");
+    if (!supabaseBase)
+      return bad(500, "Missing SUPABASE_URL / NEXT_PUBLIC_SUPABASE_URL");
+    if (!anonKey)
+      return bad(500, "Missing NEXT_PUBLIC_SUPABASE_ANON_KEY");
 
     const terminalKey = process.env.TERMINAL_KEY_TEST_001;
-    if (!terminalKey) return bad(500, "Missing TERMINAL_KEY_TEST_001 in Vercel env");
+    if (!terminalKey)
+      return bad(500, "Missing TERMINAL_KEY_TEST_001 in Vercel env");
 
     const RL_SECRET = process.env.RL_SIGNING_SECRET;
-    if (!RL_SECRET) return bad(500, "Missing RL_SIGNING_SECRET in Vercel env");
+    if (!RL_SECRET)
+      return bad(500, "Missing RL_SIGNING_SECRET in Vercel env");
 
-    const ingestUrl = buildSupabaseFunctionUrl(supabaseBase, "receipt-ingest");
+    const ingestUrl = buildSupabaseFunctionUrl(
+      supabaseBase,
+      "receipt-ingest"
+    );
 
     const bodyUnknown: unknown = await req.json().catch(() => null);
     if (!bodyUnknown || typeof bodyUnknown !== "object") {
@@ -111,8 +114,7 @@ export async function POST(req: Request) {
       return bad(400, "Missing store_id / terminal_code / retailer_id");
     }
 
-    const items = b.items;
-    if (!Array.isArray(items) || items.length === 0) {
+    if (!Array.isArray(b.items) || b.items.length === 0) {
       return bad(400, "items must not be empty");
     }
 
@@ -130,30 +132,22 @@ export async function POST(req: Request) {
       sale_id,
     };
 
-    // Sign EXACT bytes sent
+    /* ==========================
+       RL-030 canonical signing
+    ========================== */
     const rawBody = JSON.stringify(cleaned);
     const ts = Date.now().toString();
     const nonce = nonceB64url();
     const bodyHash = sha256HexUtf8(rawBody);
 
-    // Sign the ACTUAL pathname of the URL being called
     const urlPath = new URL(ingestUrl).pathname;
-    // Canonicalize to function-name-only (robust across proxies/rewrites)
     const fnName = urlPath.split("/").filter(Boolean).pop() ?? "receipt-ingest";
     const path = `/${fnName}`;
 
     const canonical = `RL1\nPOST\n${path}\n${ts}\n${nonce}\n${bodyHash}`;
-
     const sig = hmacB64url(RL_SECRET, canonical);
 
-    // Optional: turn on debug with RL_DEBUG=1 (REMOVE after fix)
-    if (isOn(process.env.RL_DEBUG)) {
-      console.log("RL DEBUG issue-receipt ingestUrl:", ingestUrl);
-      console.log("RL DEBUG issue-receipt path:", path);
-      console.log("RL DEBUG issue-receipt canonical:\n", canonical);
-      console.log("RL DEBUG issue-receipt bodyHash:", bodyHash);
-      console.log("RL DEBUG issue-receipt sig:", sig);
-    }
+    const debug = req.headers.get("x-rl-debug") === "1";
 
     const res = await fetch(ingestUrl, {
       method: "POST",
@@ -161,9 +155,7 @@ export async function POST(req: Request) {
         "Content-Type": "application/json",
         apikey: anonKey,
         Authorization: `Bearer ${anonKey}`,
-
         "x-terminal-key": terminalKey,
-
         "x-rl-ts": ts,
         "x-rl-nonce": nonce,
         "x-rl-body-sha256": bodyHash,
@@ -173,18 +165,61 @@ export async function POST(req: Request) {
     });
 
     const text = await res.text();
-    let parsed: unknown = null;
+    let parsed: unknown;
     try {
       parsed = JSON.parse(text);
     } catch {
       parsed = { raw: text };
     }
 
+    /* ==========================
+       TEMP DEBUG ECHO (REMOVE)
+    ========================== */
+function asObject(v: unknown): Record<string, unknown> {
+  return v && typeof v === "object" && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : { value: v };
+}
+
+    
     if (!res.ok) {
-      return bad(502, "receipt-ingest returned non-2xx", parsed);
+      return bad(502, "receipt-ingest returned non-2xx", {
+        ...asObject(parsed),
+        ...(debug
+          ? {
+              _rl_debug: {
+                ingestUrl,
+                path,
+                ts,
+                nonce,
+                bodyHash,
+                sig,
+                rawBody,
+              },
+            }
+          : {}),
+      });
     }
 
-    return NextResponse.json(parsed, { status: 200 });
+    return NextResponse.json(
+      {
+        ...asObject(parsed),
+        ...(debug
+          ? {
+              _rl_debug: {
+                ingestUrl,
+                path,
+                ts,
+                nonce,
+                bodyHash,
+                sig,
+                rawBody,
+              },
+            }
+          : {}),
+      },
+      { status: 200 }
+    );
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     return bad(500, "Unhandled error", msg);
