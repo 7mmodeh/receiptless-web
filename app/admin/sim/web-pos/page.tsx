@@ -1351,6 +1351,10 @@ export default function WebPosSimPageA5() {
         );
       }
 
+      if (!out || typeof out.ok !== "boolean") {
+        throw new Error("Invalid receipt-consume response");
+      }
+
       const already = Boolean(out?.already_consumed);
       const consumed_at =
         typeof out?.consumed_at === "string" ? out.consumed_at : null;
