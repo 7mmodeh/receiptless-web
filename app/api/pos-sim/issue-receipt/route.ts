@@ -131,6 +131,14 @@ export async function POST(req: Request) {
     const canonical = `RL1\nPOST\n${path}\n${ts}\n${nonce}\n${bodyHash}`;
     const sig = hmacB64url(RL_SECRET, canonical);
 
+    // DEBUG LOGS
+    console.log("RL DEBUG (Next) ingestUrl:", ingestUrl);
+    console.log("RL DEBUG (Next) pathname used:", new URL(ingestUrl).pathname);
+    console.log("RL DEBUG (Next) canonical string:\n", canonical);
+    console.log("RL DEBUG (Next) bodyHash:", bodyHash);
+    console.log("RL DEBUG (Next) sig:", sig);
+    console.log("RL DEBUG (Next) rawBody:", rawBody);
+    
     const res = await fetch(ingestUrl, {
       method: "POST",
       headers: {
