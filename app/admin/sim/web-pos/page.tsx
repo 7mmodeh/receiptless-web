@@ -1340,9 +1340,11 @@ export default function WebPosSimPageA5() {
         }),
       });
 
-      const out = (await res
-        .json()
-        .catch(() => null)) as ConsumeReceiptResponse | null;
+      const outUnknown: unknown = await res.json().catch(() => null);
+      const out =
+        outUnknown && typeof outUnknown === "object"
+          ? (outUnknown as ConsumeReceiptResponse)
+          : null;
 
       if (!res.ok) {
         const details = out?.details ?? out ?? { status: res.status };

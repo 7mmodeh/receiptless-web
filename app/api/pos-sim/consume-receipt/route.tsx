@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 
 type Body = {
-  retailer_id: string;
+  retailer_id?: string | null; // OPTIONAL (edge derives it from terminal)
   store_id: string;
   terminal_code: string;
   token_id: string;
@@ -18,6 +18,12 @@ function bad(status: number, error: string, details?: unknown) {
     { error, ...(details ? { details } : {}) },
     { status }
   );
+}
+
+function asNonEmptyString(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const t = v.trim();
+  return t.length ? t : null;
 }
 
 export async function POST(req: Request) {
@@ -46,20 +52,32 @@ export async function POST(req: Request) {
       ""
     )}/functions/v1/receipt-consume`;
 
-    const body = (await req.json().catch(() => null)) as Body | null;
-    if (!body) return bad(400, "Invalid JSON body");
-
-    if (
-      !body.retailer_id ||
-      !body.store_id ||
-      !body.terminal_code ||
-      !body.token_id
-    ) {
-      return bad(
-        400,
-        "Missing retailer_id / store_id / terminal_code / token_id"
-      );
+    const bodyUnknown: unknown = await req.json().catch(() => null);
+    if (!bodyUnknown || typeof bodyUnknown !== "object") {
+      return bad(400, "Invalid JSON body");
     }
+
+    const b = bodyUnknown as Record<string, unknown>;
+
+    // retailer_id is optional now
+    const retailer_id = asNonEmptyString(b.retailer_id);
+    const store_id = asNonEmptyString(b.store_id);
+    const terminal_code = asNonEmptyString(b.terminal_code);
+    const token_id = asNonEmptyString(b.token_id);
+    const reason = asNonEmptyString(b.reason) ?? null;
+
+    // REQUIRED fields (retailer_id NOT required)
+    if (!store_id || !terminal_code || !token_id) {
+      return bad(400, "Missing store_id / terminal_code / token_id");
+    }
+
+    const cleaned: Body = {
+      store_id,
+      terminal_code,
+      token_id,
+      reason, // null if empty
+      ...(retailer_id ? { retailer_id } : {}),
+    };
 
     const res = await fetch(consumeUrl, {
       method: "POST",
@@ -67,13 +85,14 @@ export async function POST(req: Request) {
         "Content-Type": "application/json",
         apikey: anonKey,
         Authorization: `Bearer ${anonKey}`,
-        "x-terminal-key": terminalKey,
+        "x-verifier-key": terminalKey,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(cleaned),
     });
 
     const text = await res.text();
     let parsed: unknown = null;
+
     try {
       parsed = JSON.parse(text);
     } catch {
