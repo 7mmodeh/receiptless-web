@@ -1,3 +1,5 @@
+// app/api/pos-sim/issue-receipt/route.ts
+
 import { NextResponse } from "next/server";
 
 type ReceiptItemInput = {
