@@ -1178,6 +1178,9 @@ export default function WebPosSimPageA5() {
       store_id: snap.terminal.store_id,
       terminal_code: snap.terminal.terminal_code,
 
+      // RL-011/RL-020 idempotency anchor:
+      sale_id: snap.active_sale_id, // REQUIRED
+
       issued_at: new Date().toISOString(),
       receipt_number: null,
 
