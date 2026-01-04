@@ -114,8 +114,13 @@ export async function POST(req: Request) {
     const nonce = nonceB64url();
     const bodyHash = sha256HexUtf8(rawBody);
 
-    const path = new URL(consumeUrl).pathname;
+    const urlPath = new URL(consumeUrl).pathname;
+    const fnName =
+      urlPath.split("/").filter(Boolean).pop() ?? "receipt-consume";
+    const path = `/${fnName}`;
+
     const canonical = `RL1\nPOST\n${path}\n${ts}\n${nonce}\n${bodyHash}`;
+
     const sig = hmacB64url(RL_SECRET, canonical);
 
     if (isOn(process.env.RL_DEBUG)) {

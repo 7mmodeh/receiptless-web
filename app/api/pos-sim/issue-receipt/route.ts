@@ -137,8 +137,13 @@ export async function POST(req: Request) {
     const bodyHash = sha256HexUtf8(rawBody);
 
     // Sign the ACTUAL pathname of the URL being called
-    const path = new URL(ingestUrl).pathname;
+    const urlPath = new URL(ingestUrl).pathname;
+    // Canonicalize to function-name-only (robust across proxies/rewrites)
+    const fnName = urlPath.split("/").filter(Boolean).pop() ?? "receipt-ingest";
+    const path = `/${fnName}`;
+
     const canonical = `RL1\nPOST\n${path}\n${ts}\n${nonce}\n${bodyHash}`;
+
     const sig = hmacB64url(RL_SECRET, canonical);
 
     // Optional: turn on debug with RL_DEBUG=1 (REMOVE after fix)
