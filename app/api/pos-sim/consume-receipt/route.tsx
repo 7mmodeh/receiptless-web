@@ -1,3 +1,5 @@
+// app/api/pos-sim/consume-receipt/route.tsx
+
 import { NextResponse } from "next/server";
 import crypto from "crypto";
 
@@ -14,10 +16,40 @@ function isOn(v: string | undefined) {
   return s === "true" || s === "1" || s === "yes" || s === "on";
 }
 
-function bad(status: number, error: string, details?: unknown) {
+function asObject(v: unknown): Record<string, unknown> {
+  return v && typeof v === "object" && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : { value: v };
+}
+
+function noStoreHeaders() {
+  return {
+    "Cache-Control": "no-store, max-age=0",
+    Pragma: "no-cache",
+  };
+}
+
+function bad(
+  status: number,
+  error: string,
+  request_id: string,
+  details?: unknown
+) {
   return NextResponse.json(
-    { error, ...(details ? { details } : {}) },
-    { status }
+    {
+      ok: false,
+      error,
+      request_id,
+      ...(details ? { details: asObject(details) } : {}),
+    },
+    { status, headers: noStoreHeaders() }
+  );
+}
+
+function ok(status: number, body: unknown, request_id: string) {
+  return NextResponse.json(
+    { ok: true, request_id, ...asObject(body) },
+    { status, headers: noStoreHeaders() }
   );
 }
 
@@ -55,12 +87,34 @@ function buildSupabaseFunctionUrl(base: string, fnName: string) {
   return `${b}/functions/v1/${fnName}`;
 }
 
+function canonicalFnPathFromUrl(fullUrl: string, fallbackFnName: string) {
+  const urlPath = new URL(fullUrl).pathname;
+  const fnName = urlPath.split("/").filter(Boolean).pop() ?? fallbackFnName;
+  return `/${fnName}`;
+}
+
+export async function OPTIONS() {
+  // POS sim routes are intended for server-to-server use.
+  // Still respond cleanly to preflight if someone hits it from a browser.
+  return new NextResponse(null, {
+    status: 204,
+    headers: {
+      ...noStoreHeaders(),
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
+      "Access-Control-Allow-Headers": "content-type",
+    },
+  });
+}
+
 export async function POST(req: Request) {
+  const request_id = crypto.randomUUID();
+
   try {
     const enabled =
       isOn(process.env.POS_SIM_ENABLED) ||
       isOn(process.env.NEXT_PUBLIC_POS_SIM_ENABLED);
-    if (!enabled) return bad(404, "POS simulator not enabled");
+    if (!enabled) return bad(404, "pos_sim_not_enabled", request_id);
 
     const supabaseBase =
       process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -69,15 +123,37 @@ export async function POST(req: Request) {
       process.env.SUPABASE_ANON_KEY;
 
     if (!supabaseBase)
-      return bad(500, "Missing SUPABASE_URL / NEXT_PUBLIC_SUPABASE_URL");
-    if (!anonKey) return bad(500, "Missing NEXT_PUBLIC_SUPABASE_ANON_KEY");
+      return bad(
+        500,
+        "missing_supabase_url",
+        request_id,
+        "Missing SUPABASE_URL / NEXT_PUBLIC_SUPABASE_URL"
+      );
+    if (!anonKey)
+      return bad(
+        500,
+        "missing_anon_key",
+        request_id,
+        "Missing NEXT_PUBLIC_SUPABASE_ANON_KEY"
+      );
 
     const terminalKey = process.env.TERMINAL_KEY_TEST_001;
     if (!terminalKey)
-      return bad(500, "Missing TERMINAL_KEY_TEST_001 in Vercel env");
+      return bad(
+        500,
+        "missing_terminal_key_test_001",
+        request_id,
+        "Missing TERMINAL_KEY_TEST_001 in env"
+      );
 
     const RL_SECRET = process.env.RL_SIGNING_SECRET;
-    if (!RL_SECRET) return bad(500, "Missing RL_SIGNING_SECRET in Vercel env");
+    if (!RL_SECRET)
+      return bad(
+        500,
+        "missing_rl_signing_secret",
+        request_id,
+        "Missing RL_SIGNING_SECRET in env"
+      );
 
     const consumeUrl = buildSupabaseFunctionUrl(
       supabaseBase,
@@ -86,7 +162,7 @@ export async function POST(req: Request) {
 
     const bodyUnknown: unknown = await req.json().catch(() => null);
     if (!bodyUnknown || typeof bodyUnknown !== "object") {
-      return bad(400, "Invalid JSON body");
+      return bad(400, "invalid_json_body", request_id);
     }
 
     const b = bodyUnknown as Record<string, unknown>;
@@ -98,7 +174,12 @@ export async function POST(req: Request) {
     const reason = asNonEmptyString(b.reason) ?? null;
 
     if (!store_id || !terminal_code || !token_id) {
-      return bad(400, "Missing store_id / terminal_code / token_id");
+      return bad(
+        400,
+        "missing_fields",
+        request_id,
+        "Missing store_id / terminal_code / token_id"
+      );
     }
 
     const cleaned: Body = {
@@ -109,26 +190,32 @@ export async function POST(req: Request) {
       ...(retailer_id ? { retailer_id } : {}),
     };
 
+    /* ==========================
+       RL-030 canonical signing
+    ========================== */
     const rawBody = JSON.stringify(cleaned);
     const ts = Date.now().toString();
     const nonce = nonceB64url();
     const bodyHash = sha256HexUtf8(rawBody);
 
-    const urlPath = new URL(consumeUrl).pathname;
-    const fnName =
-      urlPath.split("/").filter(Boolean).pop() ?? "receipt-consume";
-    const path = `/${fnName}`;
+    // Canonicalize to function-name-only (robust across internal routing)
+    const path = canonicalFnPathFromUrl(consumeUrl, "receipt-consume");
 
     const canonical = `RL1\nPOST\n${path}\n${ts}\n${nonce}\n${bodyHash}`;
-
     const sig = hmacB64url(RL_SECRET, canonical);
 
     if (isOn(process.env.RL_DEBUG)) {
-      console.log("RL DEBUG consume-receipt consumeUrl:", consumeUrl);
-      console.log("RL DEBUG consume-receipt path:", path);
-      console.log("RL DEBUG consume-receipt canonical:\n", canonical);
-      console.log("RL DEBUG consume-receipt bodyHash:", bodyHash);
-      console.log("RL DEBUG consume-receipt sig:", sig);
+      console.log(
+        JSON.stringify({
+          request_id,
+          fn: "pos-sim/consume-receipt",
+          consumeUrl,
+          path,
+          ts,
+          nonce,
+          bodyHash,
+        })
+      );
     }
 
     const res = await fetch(consumeUrl, {
@@ -157,12 +244,12 @@ export async function POST(req: Request) {
     }
 
     if (!res.ok) {
-      return bad(502, "receipt-consume returned non-2xx", parsed);
+      return bad(502, "receipt_consume_non_2xx", request_id, parsed);
     }
 
-    return NextResponse.json(parsed, { status: 200 });
+    return ok(200, parsed, request_id);
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
-    return bad(500, "Unhandled error", msg);
+    return bad(500, "unhandled_error", request_id, msg);
   }
 }
